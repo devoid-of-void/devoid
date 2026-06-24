@@ -109,7 +109,7 @@ host_side_code()
 	luks2_pass=$(dialog --keep-tite --insecure --title "LUKS2 recovery" --passwordbox "\nEnter LUKS2 passphrase:" 9 40 2>&1 </dev/tty >/dev/tty)
 	echo -n "$luks2_pass" | cryptsetup luksFormat "$l_physical_root_partition" --type luks2 --batch-mode --key-file=-
 
-	echo -n "$luks2_pass" | cryptsetup luksOpen "$l_physical_root_partition" cryptoroot --key-file=-
+	echo -n "$luks2_pass" | cryptsetup open "$l_physical_root_partition" cryptoroot --key-file=-
 
 	echo -n "$luks2_pass" | systemd-creds encrypt --name=cryptenroll.passphrase - $c_credentials_directory/cryptenroll.passphrase
 	unset luks2_pass
@@ -593,7 +593,7 @@ cleanup()
 
  	[ -d "${c_target}" ] && umount -R "${c_target}"
 
- 	cryptsetup luksClose "${c_luks_root_device}"
+ 	cryptsetup close "${c_luks_root_device}"
 
 	#endregion
 
