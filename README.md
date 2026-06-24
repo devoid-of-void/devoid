@@ -1,6 +1,8 @@
 # devoid
 **d**evoid is **e**xalted and very **o**pinionated **i**nstaller for **d**ebian
+
 it is also
+
 **d**evoid of **e**vanescent **v**alue **o**ptions; **i**ntentionally and *d*eliberately.
 
 **WARNING**: devoid will make your computer devoid of all data, windows, purpose and proper functioning.  **devoid** is not intended for production use of any sort or for new and inexperienced linux users. If your computer doesn't end up bricked, you might actually get debian installed on it. Maybe. Proceed at your own risk, you have been warned. 
