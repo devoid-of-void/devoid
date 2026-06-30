@@ -72,7 +72,7 @@ host_side_code()
 	#region Partition the target drive
 	sgdisk --zap-all "${l_disk}"
 	l_efi_system_partition_uuid=$(uuidgen)
-	sgdisk --new=1:2048:+1G  \
+	sgdisk --new=1:2048:+2G  \
 			--typecode=1:ef00 \
 			--change-name=1:"EFI system partition" \
 			--partition-guid=1:"${l_efi_system_partition_uuid}" \
