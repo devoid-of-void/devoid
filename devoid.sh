@@ -164,6 +164,7 @@ host_side_code()
 
 	echo "/dev/mapper/luks-${l_luks_uuid} / xfs defaults 0 1" > "${c_target}"/etc/fstab
 	echo "PARTUUID=${l_efi_system_partition_uuid} /boot/efi vfat defaults,umask=077 0 2" >> "${c_target}"/etc/fstab
+	echo "/swapfile none swap sw 0 0" >> "${c_target}"/etc/fstab
 	#endregion
 
 	#region Debootstrap the base system
@@ -550,6 +551,11 @@ target_side_code()
 	efi-updatevar -e -f $c_signing_certificate_pem.esl KEK
 	efi-updatevar -f $c_signing_certificate_pem.auth PK
 	#endregion
+
+	#region Setup a small swapfile
+	fallocate -l 8G /swapfile
+	chmod 600 /swapfile
+	mkswap /swapfile
 
 	#region Prepare TPM enrollment scriplet
 	cat <<- EOF > /root/tpm-enroll.sh
