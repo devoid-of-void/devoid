@@ -533,19 +533,11 @@ target_side_code()
 
 	cert-to-efi-sig-list -g "$l_owner_guid" $c_signing_certificate_pem $c_signing_certificate_pem.esl 
 
-	# its an ugly hack, but there's no point in wrestling with outdated efitools.
-	# there is a patch for openssl 3.0 providers, but it hasn't been merged yet
-	expect <<- EOF
-		spawn sign-efi-sig-list -e pkcs11 \
-		-k "$l_signing_private_key_uri" \
-		-c "$c_signing_certificate_pem" \
-		PK "$c_signing_certificate_pem.esl" "$c_signing_certificate_pem.auth"
-		expect "pass phrase:"
-		send "$PKCSPIN\r"
-		expect "pass phrase:"
-		send "$PKCSPIN\r"
-		expect eof
-	EOF
+	# efitools now supports openssl 3.0 providers
+	sign-efi-sig-list -e pkcs11 \
+	-k "$l_signing_private_key_uri" \
+	-c "$c_signing_certificate_pem" \
+	PK "$c_signing_certificate_pem.esl" "$c_signing_certificate_pem.auth"
 
 	efi-updatevar -e -f $c_signing_certificate_pem.esl db
 	efi-updatevar -e -f $c_signing_certificate_pem.esl KEK
