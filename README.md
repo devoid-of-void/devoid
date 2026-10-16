@@ -66,4 +66,44 @@ Once it's finished, reboot. There will be an `enroll_tpm.sh` script in `/root` y
 
 Finally, start tasksel to choose your desktop environment if required, install drivers as needed, and reboot.
 
+### Auxiliary USB installation
+
+`sudo ./devoid-usb.sh /dev/disk/by-id/usb-...` installs the portable, unencrypted
+Debian Forky variant. It erases the selected disk and uses unsigned UKIs with
+systemd-boot's removable-media fallback. It does not enroll Secure Boot keys.
+
+The USB includes Debian's packaged firmware for Atheros networking (including
+AR7010/AR9271 USB Wi-Fi), Intel Wi-Fi (iwlwifi and legacy ipw2x00), miscellaneous
+Intel network devices, and AMD, Intel and NVIDIA GPUs. The legacy Intel Wi-Fi
+package asks for licence acceptance during installation. Firmware is installed
+before the kernel/UKIs are generated, irrespective of the build machine's hardware.
+NVIDIA graphics firmware here is for Nouveau; CUDA still needs a compatible
+NVIDIA driver installed separately.
+
+The installer also enables these signed APT repositories:
+
+| Vendor | Repository | Purpose |
+| --- | --- | --- |
+| NVIDIA | CUDA network repository for Debian 13 | CUDA toolkits and NVIDIA driver packages |
+| AMD | ROCm Core native Debian 13 stable repository | HIP/ROCm compute packages |
+| Intel | oneAPI APT repository | oneAPI compilers, libraries and tools |
+
+Forky is not a vendor-qualified CUDA/ROCm distribution; these use the vendors'
+Debian 13 packages. Repository availability does not guarantee GPU, kernel or
+dependency compatibility. Intel oneAPI also requires a suitable GPU compute
+runtime/driver when used on a GPU. No Ubuntu graphics repository is added.
+
+Vendor repositories have APT priority 100, below Debian's normal 500, so Debian
+packages remain preferred. Vendor-only packages are available for explicit
+installation; selecting vendor versions of overlapping packages may require
+an explicit version or a deliberate pin change. The installer leaves the large
+SDKs and proprietary/DKMS drivers for separate installation on the intended
+machine. It does not blacklist Nouveau or replace Debian's graphics stack.
+
+Repository references:
+[CUDA](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/),
+[ROCm](https://rocm.docs.amd.com/en/latest/install/rocm.html),
+[oneAPI](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-apt.html).
+
+
 
