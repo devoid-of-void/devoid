@@ -1,5 +1,20 @@
 #!/bin/bash
 set -euo pipefail
+
+#region Constants
+# readonly DEFAULT_DISK="/dev/disk/by-id/virtio-target"
+readonly DEFAULT_DISK="/dev/disk/by-id/ata-KINGSTON_RBU-SNS8152S3256GG2_50026B7369011B0A"
+
+readonly DEBIAN_VERSION="forky"
+
+readonly TARGET="/mnt/target"
+readonly SIGNING_CERTIFICATE_DER="/etc/kernel/keys/signing-certificate.der"
+readonly SIGNING_CERTIFICATE_PEM="/etc/kernel/keys/signing-certificate.pem"
+readonly LUKS_ROOT_DEVICE=/dev/mapper/cryptoroot
+readonly CREDENTIALS_DIR="/run/credentials"
+readonly PIV_PIN_KEY_NAME="devoid:piv-pin"
+#endregion
+
 # set -x
 # signing slot is 9c
 # if the YubiKey has a pre-generated key in slot 9c, this will overwrite it without warning, so be careful with this line
@@ -9,18 +24,6 @@ set -euo pipefail
 # yubico-piv-tool -s9a -ARSA2048 --pin="$p_PIV_PIN" -averify-pin -agenerate --touch-policy=cached -opub.pem
 # yubico-piv-tool -s9a -S'/CN=luks2-key/OU=voids/O=debian.org/' --pin="$p_PIV_PIN" -averify-pin -aselfsign -ipub.pem -opub.crt
 # yubico-piv-tool -s9a --pin="$p_PIV_PIN" -averify-pin -aimport-certificate -ipub.crt
-
-#c_disk="/dev/disk/by-id/virtio-target"
-c_disk="/dev/disk/by-id/ata-KINGSTON_RBU-SNS8152S3256GG2_50026B7369011B0A"
-
-p_debian_version="forky"
-
-c_target="/mnt/target"
-c_signing_certificate_der="/etc/kernel/keys/signing-certificate.der"
-c_signing_certificate_pem="/etc/kernel/keys/signing-certificate.pem"
-c_luks_root_device=/dev/mapper/cryptoroot
-c_credentials_directory="/run/credentials"
-c_piv_pin_key_name="devoid:piv-pin"
 
 host_side_code()
 {
@@ -43,7 +46,7 @@ host_side_code()
 	#endregion
 
 	#region Check prerequisites: disks, YubiKey, TPM
-	l_disk=$(dialog --keep-tite  --stdout --inputbox "Enter installation disk:" 8 50 "${c_disk}")
+	l_disk=$(dialog --keep-tite  --stdout --inputbox "Enter installation disk:" 8 50 "${DEFAULT_DISK}")
 	echo "Selected disk: $l_disk"
 	error_message=""
 	no_messages=0
@@ -104,35 +107,35 @@ host_side_code()
 	#region Setup LUKS2 on root partition: passphrase, YubiKey and TPM2
 
 	# mkdir -p ignores -m for intermediate directories; set mode explicitly on the final
-	install -d -m 0700 "$c_credentials_directory"
+	install -d -m 0700 "$CREDENTIALS_DIR"
 
 	luks2_pass=$(dialog --keep-tite --insecure --title "LUKS2 recovery" --passwordbox "\nEnter LUKS2 passphrase:" 9 40 2>&1 </dev/tty >/dev/tty)
 	echo -n "$luks2_pass" | cryptsetup luksFormat "$l_physical_root_partition" --type luks2 --batch-mode --key-file=-
 
 	echo -n "$luks2_pass" | cryptsetup open "$l_physical_root_partition" cryptoroot --key-file=-
 
-	echo -n "$luks2_pass" | systemd-creds encrypt --name=cryptenroll.passphrase - $c_credentials_directory/cryptenroll.passphrase
+	echo -n "$luks2_pass" | systemd-creds encrypt --name=cryptenroll.passphrase - $CREDENTIALS_DIR/cryptenroll.passphrase
 	unset luks2_pass
 
 	fido2_pin=$(dialog --keep-tite --insecure --title "FIDO2 to LUKS2 enrollment" --passwordbox "\nEnter FIDO2 PIN:" 9 40 2>&1 </dev/tty >/dev/tty)
-	echo -n "$fido2_pin" | systemd-creds encrypt --name=cryptenroll.fido2-pin - $c_credentials_directory/cryptenroll.fido2-pin
+	echo -n "$fido2_pin" | systemd-creds encrypt --name=cryptenroll.fido2-pin - $CREDENTIALS_DIR/cryptenroll.fido2-pin
 
 	systemd-run --pty --wait --collect 	\
-	 			--property="LoadCredentialEncrypted=cryptenroll.fido2-pin:$c_credentials_directory/cryptenroll.fido2-pin" \
-				--property="LoadCredentialEncrypted=cryptenroll.passphrase:$c_credentials_directory/cryptenroll.passphrase" \
+	 			--property="LoadCredentialEncrypted=cryptenroll.fido2-pin:$CREDENTIALS_DIR/cryptenroll.fido2-pin" \
+				--property="LoadCredentialEncrypted=cryptenroll.passphrase:$CREDENTIALS_DIR/cryptenroll.passphrase" \
 		/usr/bin/systemd-cryptenroll --fido2-device=auto "$l_physical_root_partition"
 
 	#if no tpm2 token is enrolled, systemd will fail to boot without asking for password, so here's one that will fallback to passphrase
 	systemd-run --pty --wait --collect 	\
-	 			--property="LoadCredentialEncrypted=cryptenroll.passphrase:$c_credentials_directory/cryptenroll.passphrase" \
+	 			--property="LoadCredentialEncrypted=cryptenroll.passphrase:$CREDENTIALS_DIR/cryptenroll.passphrase" \
 		/usr/bin/systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7 --wipe-slot=tpm2 "$l_physical_root_partition"
 
-	shred -u "$c_credentials_directory/cryptenroll.fido2-pin"
-	shred -u "$c_credentials_directory/cryptenroll.passphrase"
+	shred -u "$CREDENTIALS_DIR/cryptenroll.fido2-pin"
+	shred -u "$CREDENTIALS_DIR/cryptenroll.passphrase"
 
 
 	l_luks_uuid=$(cryptsetup luksUUID "${l_physical_root_partition}")
-	l_root_partition=${c_luks_root_device}
+	l_root_partition=${LUKS_ROOT_DEVICE}
 
 	udevadm trigger --subsystem-match=block
 	udevadm settle
@@ -144,16 +147,16 @@ host_side_code()
 	mkfs.xfs -m uuid="${l_rootfs_uuid}" -L root "${l_root_partition}"
 
 	# Temporary mountpoint
-	mkdir -p "${c_target}"
-	mount "${l_root_partition}" "${c_target}"
+	mkdir -p "${TARGET}"
+	mount "${l_root_partition}" "${TARGET}"
 
 	# Persistent directories
-	install -d -m 0755 "${c_target}/home"
-	install -d -m 0755 "${c_target}/etc"
+	install -d -m 0755 "${TARGET}/home"
+	install -d -m 0755 "${TARGET}/etc"
 
 	# ESP mountpoint
-	mkdir -p "${c_target}/boot/efi"
-	mount "${l_efi_system_partition}" "${c_target}/boot/efi" -o umask=077
+	mkdir -p "${TARGET}/boot/efi"
+	mount "${l_efi_system_partition}" "${TARGET}/boot/efi" -o umask=077
 	#endregion
 
 	#region Setup fstab    
@@ -162,37 +165,37 @@ host_side_code()
 	#         └─ /dev/mapper/cryptoroot
 	#             └─ XFS filesystem (UUID=<rootfs-uuid>)
 
-	echo "/dev/mapper/luks-${l_luks_uuid} / xfs defaults 0 1" > "${c_target}"/etc/fstab
-	echo "PARTUUID=${l_efi_system_partition_uuid} /boot/efi vfat defaults,umask=077 0 2" >> "${c_target}"/etc/fstab
-	echo "/swapfile none swap sw 0 0" >> "${c_target}"/etc/fstab
+	echo "/dev/mapper/luks-${l_luks_uuid} / xfs defaults 0 1" > "${TARGET}"/etc/fstab
+	echo "PARTUUID=${l_efi_system_partition_uuid} /boot/efi vfat defaults,umask=077 0 2" >> "${TARGET}"/etc/fstab
+	echo "/swapfile none swap sw 0 0" >> "${TARGET}"/etc/fstab
 	#endregion
 
 	#region Debootstrap the base system
-	unshare -m mmdebstrap --mode=root --variant=apt "${p_debian_version}" "${c_target}" \
+	unshare -m mmdebstrap --mode=root --variant=apt "${DEBIAN_VERSION}" "${TARGET}" \
 		--components="main contrib non-free non-free-firmware"  \
 		--skip=check/empty 
 	#endregion
 	
 	#region Setup kernel cmdline 
-	install -d -m 0755 "${c_target}"/etc/kernel
+	install -d -m 0755 "${TARGET}"/etc/kernel
 	# for debug shell add    "rd.debug rd.shell rd.break=pre-mount" 
 	l_kernel_command_line="quiet splash rw root=UUID=${l_rootfs_uuid} rootfstype=xfs rd.luks.uuid=${l_luks_uuid} rootflags=rw "
 
 	l_kernel_command_line+=" rd.luks.options=${l_luks_uuid}=pkcs11-uri=auto,tpm2-device=auto "
 
-	echo "$l_kernel_command_line" > "${c_target}"/etc/kernel/cmdline 
+	echo "$l_kernel_command_line" > "${TARGET}"/etc/kernel/cmdline 
 	#endregion
 
 	#region Set hostname
 	l_hostname=$(dialog --keep-tite  --stdout --inputbox "Enter hostname:" 8 50 "devoid-forky")
-	echo "127.0.1.1 $l_hostname" >> "${c_target}"/etc/hosts
-	echo "$l_hostname" > "${c_target}"/etc/hostname
+	echo "127.0.1.1 $l_hostname" >> "${TARGET}"/etc/hosts
+	echo "$l_hostname" > "${TARGET}"/etc/hostname
 	#endregion
 
 
 	#region set pam configuration for fido2 login
 	echo "Please touch the YubiKey to enable passwordless root login..."
-	expect <<- EOF > $c_credentials_directory/u2f_keys
+	expect <<- EOF > $CREDENTIALS_DIR/u2f_keys
 		spawn pamu2fcfg --username=root --origin=pam://$l_hostname --pin-verification
 		expect {
 			"Enter PIN" { send "$fido2_pin\r" }
@@ -204,15 +207,15 @@ host_side_code()
 	#endregion
 
 	#region copy root's pam credentials for later use in the container
-	install -d -m 0700 "${c_target}/etc/u2f_mappings"
-	grep "root" $c_credentials_directory/u2f_keys > "${c_target}/etc/u2f_mappings/u2f_keys"
-	shred -u $c_credentials_directory/u2f_keys
+	install -d -m 0700 "${TARGET}/etc/u2f_mappings"
+	grep "root" $CREDENTIALS_DIR/u2f_keys > "${TARGET}/etc/u2f_mappings/u2f_keys"
+	shred -u $CREDENTIALS_DIR/u2f_keys
 	#endregion
 
 	#region Start target side script in nspawn container
 	
 	# echo systemd-nspawn  --bind=devoid.sh:/devoid.sh \
-	# 				--directory="${c_target}" \
+	# 				--directory="${TARGET}" \
 	# 				--bind="${l_physical_root_partition}" \
 	# 				--bind="$(realpath "${l_physical_root_partition}")" \
     # 				--timezone=off \
@@ -228,7 +231,7 @@ host_side_code()
 	# 				--property='"DeviceAllow=/dev/bus/usb rwm"' -- > run_cont.sh
 
 	unshare -m systemd-nspawn  --bind=devoid.sh:/devoid.sh \
-					--directory="${c_target}" \
+					--directory="${TARGET}" \
 					--bind="${l_physical_root_partition}" \
 					--bind="$(realpath "${l_physical_root_partition}")" \
                     --timezone=off \
@@ -266,7 +269,7 @@ host_side_code()
 	#endregion
 
 	#region Copy NetworkManager configs, if any, to preserve wifi settings 
-	cp /etc/NetworkManager/system-connections/* "${c_target}/etc/NetworkManager/system-connections/" || true
+	cp /etc/NetworkManager/system-connections/* "${TARGET}/etc/NetworkManager/system-connections/" || true
 	#endregion
 
 }
@@ -310,7 +313,7 @@ target_side_code()
 
 	#region get and cache the PIV PIN for later use in DKMS module signing and secureboot signing
 	piv_pin=$(dialog --keep-tite --insecure --title "DKMS signing" --passwordbox "\nEnter PIV PIN:" 9 40 2>&1 </dev/tty >/dev/tty)
-	keyctl add user "$c_piv_pin_key_name" "$piv_pin" @s
+	keyctl add user "$PIV_PIN_KEY_NAME" "$piv_pin" @s
 	export PKCSPIN=$piv_pin
 	#endregion
 
@@ -332,15 +335,15 @@ target_side_code()
 	#region Setup keys for secureboot and DKMS
 	install -d -m 0700 "/etc/kernel/keys"
 	
-	install -d -m 0700 -- "$(dirname -- "$c_signing_certificate_der")"
+	install -d -m 0700 -- "$(dirname -- "$SIGNING_CERTIFICATE_DER")"
 
-	touch "$c_signing_certificate_der"
+	touch "$SIGNING_CERTIFICATE_DER"
 
-	pkcs11-tool --module "$g_p11_module" --read-object --type cert --id 02 --output-file "${c_signing_certificate_der}"
+	pkcs11-tool --module "$g_p11_module" --read-object --type cert --id 02 --output-file "${SIGNING_CERTIFICATE_DER}"
 
 	l_signing_private_key_uri=$(pkcs11-tool --module "$g_p11_module" --list-objects --id=02 --type privkey --pin "$piv_pin" | grep -o "pkcs11:.*")
 
-	openssl x509 -in "${c_signing_certificate_der}" -outform PEM -out "${c_signing_certificate_pem}"
+	openssl x509 -in "${SIGNING_CERTIFICATE_DER}" -outform PEM -out "${SIGNING_CERTIFICATE_PEM}"
 	#endregion
 
 	#region Configure initramfs generation
@@ -371,7 +374,7 @@ target_side_code()
 
 	cat <<- EOF > /etc/dkms/framework.conf.d/signing.conf
 		mok_signing_key="${l_signing_private_key_uri}"
-		mok_certificate="${c_signing_certificate_der}"
+		mok_certificate="${SIGNING_CERTIFICATE_DER}"
 		sign_file="/etc/dkms/sign_helper.sh"
 	EOF
 	#endregion
@@ -390,7 +393,7 @@ target_side_code()
 
 	#region make the certificate easy to enroll manually via UEFI if needed
 	install -d -m 0755 "/boot/efi/EFI/secureboot"
-	cp  "${c_signing_certificate_der}" "/boot/efi/EFI/secureboot/mok-cert.der"
+	cp  "${SIGNING_CERTIFICATE_DER}" "/boot/efi/EFI/secureboot/mok-cert.der"
 	#endregion
 
 	#region Configure UKI signing to use yubikey
@@ -401,7 +404,7 @@ target_side_code()
 		SigningProvider=pkcs11
 		SignKernel=false
 		SecureBootPrivateKey=${l_signing_private_key_uri}
-		SecureBootCertificate=${c_signing_certificate_pem}
+		SecureBootCertificate=${SIGNING_CERTIFICATE_PEM}
 		Cmdline=@/etc/kernel/cmdline
 
 		# Optional: also for PCR signing (Measured Boot)
@@ -416,7 +419,7 @@ target_side_code()
 	cat <<- EOF > /etc/kernel/scripts/piv_pin_helper.sh
 		#!/usr/bin/bash
 
-		KEY_NAME=${c_piv_pin_key_name}
+		KEY_NAME=${PIV_PIN_KEY_NAME}
 
 		KEY_ID=\$(keyctl search @s user "\$KEY_NAME" 2>/dev/null)
 
@@ -508,7 +511,7 @@ target_side_code()
 	install -d -m 755 /boot/efi/EFI/BOOT/
 	
 	/usr/lib/systemd/systemd-sbsign sign --private-key "${l_signing_private_key_uri}" \
-		--certificate "${c_signing_certificate_pem}" \
+		--certificate "${SIGNING_CERTIFICATE_PEM}" \
 		--private-key-source provider:pkcs11 \
 		"$l_fallback" --output /boot/efi/EFI/BOOT/BOOTX64.EFI
 
@@ -529,19 +532,19 @@ target_side_code()
 	apt install -y --no-install-recommends -o Dpkg::Progress-Fancy=1 efitools uuid-runtime expect
 
 	l_owner_guid=$(uuidgen --random)
-	echo "$l_owner_guid" > $c_signing_certificate_pem.guid
+	echo "$l_owner_guid" > $SIGNING_CERTIFICATE_PEM.guid
 
-	cert-to-efi-sig-list -g "$l_owner_guid" $c_signing_certificate_pem $c_signing_certificate_pem.esl 
+	cert-to-efi-sig-list -g "$l_owner_guid" $SIGNING_CERTIFICATE_PEM $SIGNING_CERTIFICATE_PEM.esl 
 
 	# efitools now supports openssl 3.0 providers
 	sign-efi-sig-list -e pkcs11 \
 	-k "$l_signing_private_key_uri" \
-	-c "$c_signing_certificate_pem" \
-	PK "$c_signing_certificate_pem.esl" "$c_signing_certificate_pem.auth"
+	-c "$SIGNING_CERTIFICATE_PEM" \
+	PK "$SIGNING_CERTIFICATE_PEM.esl" "$SIGNING_CERTIFICATE_PEM.auth"
 
-	efi-updatevar -e -f $c_signing_certificate_pem.esl db
-	efi-updatevar -e -f $c_signing_certificate_pem.esl KEK
-	efi-updatevar -f $c_signing_certificate_pem.auth PK
+	efi-updatevar -e -f $SIGNING_CERTIFICATE_PEM.esl db
+	efi-updatevar -e -f $SIGNING_CERTIFICATE_PEM.esl KEK
+	efi-updatevar -f $SIGNING_CERTIFICATE_PEM.auth PK
 	#endregion
 
 	#region Setup a small swapfile
@@ -589,9 +592,9 @@ cleanup()
 
  	sync
 
- 	[ -d "${c_target}" ] && umount -R "${c_target}"
+ 	[ -d "${TARGET}" ] && umount -R "${TARGET}"
 
- 	cryptsetup close "${c_luks_root_device}"
+ 	cryptsetup close "${LUKS_ROOT_DEVICE}"
 
 	#endregion
 
