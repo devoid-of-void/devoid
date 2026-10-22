@@ -1,12 +1,20 @@
 #!/bin/bash
-# signing slot is 9c
-# if the YubiKey has a pre-generated key in slot 9c, this will overwrite it without warning, so be careful with this line
-# use only if you haven't generated a key in slot 9c before, or if you don't mind losing the existing key and any certificates associated with it
-# yubico-piv-tool -s9c --pin="$p_PIV_PIN" -agenerate --algorithm RSA2048 --touch-policy=cached -averify-pin
-# LUKS key/certificate is in 9a
-# yubico-piv-tool -s9a -ARSA2048 --pin="$p_PIV_PIN" -averify-pin -agenerate --touch-policy=cached -opub.pem
-# yubico-piv-tool -s9a -S'/CN=luks2-key/OU=voids/O=debian.org/' --pin="$p_PIV_PIN" -averify-pin -aselfsign -ipub.pem -opub.crt
-# yubico-piv-tool -s9a --pin="$p_PIV_PIN" -averify-pin -aimport-certificate -ipub.crt
+# devoid installs an opinionated Debian system with an encrypted XFS root,
+# YubiKey-assisted unlocking and login, and signed unified kernel images (UKIs).
+#
+# Run from a Debian live environment booted in UEFI mode, with network access,
+# a TPM 2.0 and a configured FIDO2/PIV YubiKey. Secure Boot key enrollment
+# requires firmware Setup Mode and an existing signing key and certificate
+# in the YubiKey's PIV slot 9c.
+#
+# Review the defaults below, then run from the directory containing this file:
+#   sudo bash ./devoid.sh
+#
+# The selected installation disk will be erased. The script prepares it on
+# the live host, then configures Debian inside a systemd-nspawn container.
+# After booting the installed system with Secure Boot enabled, run
+# /root/tpm-enroll.sh to enroll the TPM against the installed boot state.
+# /root/create_homed_user.sh USER creates a user with a FIDO2-protected home.
 
 set -euo pipefail
 # set -x
@@ -48,9 +56,10 @@ readonly PK_AUTH="${SIGNING_KEY_BASE}.auth"
 readonly SERVICE_DRIVERS_ESL="${KEYS_DIR}/service-drivers.esl"
 #endregion
 
+#region Host installation
 host_side_code()
 {
-	#region setup the host side environment 
+	#region Prepare the live environment
 	apt update
 
 	apt install -yqq --no-install-recommends --autoremove --purge -o Dpkg::Progress-Fancy=1 \
@@ -68,7 +77,7 @@ host_side_code()
 		dialog --keep-tite  --title "Restarting pcscd" --msgbox "\nPlease replug your YubiKey" 7 60
 	#endregion
 
-	#region Check prerequisites: disks, YubiKey, TPM
+	#region Select the disk and check hardware
 	l_disk=$(dialog --keep-tite  --stdout --inputbox "Enter installation disk:" 8 50 "${DEFAULT_DISK}")
 	echo "Selected disk: $l_disk"
 	error_message=""
@@ -95,7 +104,7 @@ host_side_code()
 	fi
 	#endregion
 
-	#region Partition the target drive
+	#region Partition the installation disk
 	sgdisk --zap-all "${l_disk}"
 	l_efi_system_partition_uuid=$(uuidgen)
 	sgdisk --new=1:2048:+"$DEFAULT_ESP_SIZE"  \
@@ -116,7 +125,7 @@ host_side_code()
 	udevadm settle
 	#endregion
 
-	#region Format ESP partition
+	#region Format the EFI system partition
 	l_efi_system_partition="/dev/disk/by-partuuid/${l_efi_system_partition_uuid}"
 	wipefs -a "${l_efi_system_partition}"
 	mkfs.vfat -F32 -n EFI "${l_efi_system_partition}"
@@ -127,7 +136,7 @@ host_side_code()
 	udevadm settle
 	#endregion
 
-	#region Setup LUKS2 on root partition: passphrase, YubiKey and TPM2
+	#region Encrypt root and enroll FIDO2 and TPM unlocking
 
 	# mkdir -p ignores -m for intermediate directories; set mode explicitly on the final
 	install -d -m 0700 "$CREDENTIALS_DIR"
@@ -164,7 +173,7 @@ host_side_code()
 	udevadm settle
 	#endregion
 
-	#region Format and mount root partition
+	#region Format root and mount the target filesystems
 	l_rootfs_uuid=$(uuidgen)
 	wipefs -a "${l_root_partition}"
 	mkfs.xfs -m uuid="${l_rootfs_uuid}" -L root "${l_root_partition}"
@@ -182,7 +191,7 @@ host_side_code()
 	mount "${l_efi_system_partition}" "${TARGET}/boot/efi" -o umask=077
 	#endregion
 
-	#region Setup fstab    
+	#region Write filesystem mounts
 	# GPT root partition (PARTUUID=<root-partuuid>)
 	#     └─ LUKS2 container (UUID=<luks-uuid>)
 	#         └─ /dev/mapper/cryptoroot
@@ -193,13 +202,13 @@ host_side_code()
 	echo "/swapfile none swap sw 0 0" >> "${TARGET}"/etc/fstab
 	#endregion
 
-	#region Debootstrap the base system
+	#region Bootstrap Debian
 	unshare -m mmdebstrap --mode=root --variant=apt "${DEFAULT_DEBIAN_RELEASE}" "${TARGET}" \
 		--components="main contrib non-free non-free-firmware"  \
 		--skip=check/empty 
 	#endregion
 	
-	#region Setup kernel cmdline 
+	#region Write the kernel command line
 	install -d -m 0755 "${TARGET}"/etc/kernel
 	# for debug shell add    "rd.debug rd.shell rd.break=pre-mount" 
 	l_kernel_command_line="quiet splash rw root=UUID=${l_rootfs_uuid} rootfstype=xfs rd.luks.uuid=${l_luks_uuid} rootflags=rw "
@@ -209,14 +218,14 @@ host_side_code()
 	echo "$l_kernel_command_line" > "${TARGET}"/etc/kernel/cmdline 
 	#endregion
 
-	#region Set hostname
+	#region Set the hostname
 	l_hostname=$(dialog --keep-tite  --stdout --inputbox "Enter hostname:" 8 50 "$DEFAULT_HOSTNAME")
 	echo "127.0.1.1 $l_hostname" >> "${TARGET}"/etc/hosts
 	echo "$l_hostname" > "${TARGET}"/etc/hostname
 	#endregion
 
 
-	#region set pam configuration for fido2 login
+	#region Enroll root's FIDO2 login credential
 	echo "Please touch the YubiKey to enable passwordless root login..."
 	expect <<- EOF > $CREDENTIALS_DIR/u2f_keys
 		spawn pamu2fcfg --username=root --origin=pam://$l_hostname --pin-verification
@@ -227,15 +236,12 @@ host_side_code()
 	EOF
 
 	unset fido2_pin
-	#endregion
-
-	#region copy root's pam credentials for later use in the container
 	install -d -m 0700 "${TARGET}/etc/u2f_mappings"
 	grep "root" $CREDENTIALS_DIR/u2f_keys > "${TARGET}/etc/u2f_mappings/u2f_keys"
 	shred -u $CREDENTIALS_DIR/u2f_keys
 	#endregion
 
-	#region Start target side script in nspawn container
+	#region Configure Debian inside systemd-nspawn
 	
 	# echo systemd-nspawn  --bind=devoid.sh:/devoid.sh \
 	# 				--directory="${TARGET}" \
@@ -271,16 +277,10 @@ host_side_code()
 					# --as-pid2 \
 	#endregion
 
-	#region delete all boot entries except the testing environment called 'debugging' 
+	#region Replace firmware boot entries (preserve debugging)
 	# efibootmgr | grep -v -i "debugging" | awk '/^Boot[0-9]/{print substr($1,5,4)}' | xargs -n1 efibootmgr -B -b
 	# l_deb=$(efibootmgr | grep -i "debian" | awk '/^Boot[0-9]/{print substr($1,5,4)}' )
-	#endregion
-
-	#region delete all boot entries 
 	efibootmgr | grep -v -i "debugging" | awk '/^Boot[0-9]/{print substr($1,5,4)}' | xargs -n1 efibootmgr -B -b
-	# #endregion
-
-	#region create new entry for our UKI
 	efibootmgr --create \
 		--disk $l_disk \
 		--part 1 \
@@ -291,27 +291,29 @@ host_side_code()
 		--bootnext 0000
 	#endregion
 
-	#region Copy NetworkManager configs, if any, to preserve wifi settings 
+	#region Copy NetworkManager connection profiles
 	cp /etc/NetworkManager/system-connections/* "${TARGET}/etc/NetworkManager/system-connections/" || true
 	#endregion
 
 }
 
+#endregion
+
+#region Target configuration
 target_side_code()
 {
 	p_physical_root_partition=$1
 
-	#region get admin user info
+	#region Configure locale, timezone and keyboard
 	apt update 
 	apt-get install -y dialog -o Dpkg::Progress-Fancy=1 
 
-	#region Setting up the basics: locale, timezone, keyboard
 	export DEBIAN_FRONTEND=dialog
 
 	apt-get install -y locales tzdata keyboard-configuration adduser -o Dpkg::Progress-Fancy=1 
 	#endregion
 
-	#region Setup root
+	#region Configure root authentication and shell
 	apt-get install -y git -o Dpkg::Progress-Fancy=1  curl zsh sudo sudo ssh sshfs bash dialog libpam-u2f pamu2fcfg 
 
 	root_pass=$(head -c 500 /dev/urandom | tr -dc 'A-Za-z0-9!@#$%' | head -c 12)
@@ -330,17 +332,17 @@ target_side_code()
 	chsh -s "$(which zsh)"
 	#endregion
 	
-	#region Install signing tools for secureboot and DKMS
+	#region Install Secure Boot and module signing tools
 	apt-get install -y keyutils gnutls-bin openssl mokutil sbsigntool tpm2-tools tpm2-tss libgcrypt20 -o Dpkg::Progress-Fancy=1 
 	#endregion
 
-	#region get and cache the PIV PIN for later use in DKMS module signing and secureboot signing
+	#region Cache the PIV PIN for signing
 	piv_pin=$(dialog --keep-tite --insecure --title "DKMS signing" --passwordbox "\nEnter PIV PIN:" 9 40 2>&1 </dev/tty >/dev/tty)
 	keyctl add user "$PIV_PIN_KEY_NAME" "$piv_pin" @s
 	export PKCSPIN=$piv_pin
 	#endregion
 
-	#region Setup security keys and tools for enrolling YubiKey for LUKS2 unlocking and secureboot, and for signing DKMS modules
+	#region Configure YubiKey PKCS#11 access
 	apt install --no-install-recommends -y -o Dpkg::Progress-Fancy=1  \
 		yubico-piv-tool p11-kit p11-kit-modules opensc ykcs11 \
 		opensc-pkcs11 pcscd pcsc-tools libengine-pkcs11-openssl pkcs11-provider 
@@ -355,7 +357,7 @@ target_side_code()
 	EOF
 	#endregion
 
-	#region Setup keys for secureboot and DKMS
+	#region Read the signing certificate and private-key URI
 	install -d -m 0700 "$KEYS_DIR"
 
 	touch "$SIGNING_CERTIFICATE_DER"
@@ -367,7 +369,7 @@ target_side_code()
 	openssl x509 -in "${SIGNING_CERTIFICATE_DER}" -outform PEM -out "${SIGNING_CERTIFICATE_PEM}"
 	#endregion
 
-	#region Configure initramfs generation
+	#region Configure UKI and initramfs generation
 	install -d -m 0755 /etc/kernel
 
 	cat <<-EOF > /etc/kernel/install.conf
@@ -384,13 +386,13 @@ target_side_code()
 	EOF
 	#endregion
 
-	#region temporary fix while waiting for #1056665 / #1100919 to be resolved
+	#region Define the TPM service account (Debian #1056665 / #1100919)
 	install -d -m 0755 /etc/sysusers.d/
  	echo 'u tss - "TPM2 Software Stack user" /var/lib/tpm' > /etc/sysusers.d/tpm2-tss.conf
  	echo 'g tss -' >> /etc/sysusers.d/tpm2-tss.conf
 	#endregion
 
-	#region Configure DKMS to sign modules with yubikey
+	#region Configure DKMS module signing
 	install -d -m 0755 /etc/dkms/framework.conf.d
 
 	cat <<- EOF > /etc/dkms/framework.conf.d/signing.conf
@@ -400,7 +402,7 @@ target_side_code()
 	EOF
 	#endregion
 
-	#region Create signing helper script, we need to cache the piv pin ourselves
+	#region Write the DKMS signing helper
 	install -d -m 0755 /etc/dkms
 	cat <<- EOF > /etc/dkms/sign_helper.sh
 		#!/usr/bin/bash
@@ -412,12 +414,12 @@ target_side_code()
 	chmod +x /etc/dkms/sign_helper.sh
 	#endregion
 
-	#region make the certificate easy to enroll manually via UEFI if needed
+	#region Copy the signing certificate to the ESP for manual enrollment
 	install -d -m 0755 "/boot/efi/EFI/secureboot"
 	cp  "${SIGNING_CERTIFICATE_DER}" "/boot/efi/EFI/secureboot/mok-cert.der"
 	#endregion
 
-	#region Configure UKI signing to use yubikey
+	#region Configure UKI signing with the YubiKey
 	install -d -m 0755 /etc/kernel
 	cat <<- EOF > /etc/kernel/uki.conf
 		[UKI]
@@ -435,7 +437,7 @@ target_side_code()
 	EOF
 	#endregion
 
-	#region Create signing helper script, we need to cache the piv pin ourselves
+	#region Write the PIV PIN cache helper
 	install -d -m 0755 /etc/kernel/scripts
 	cat <<- EOF > /etc/kernel/scripts/piv_pin_helper.sh
 		#!/usr/bin/bash
@@ -456,7 +458,7 @@ target_side_code()
 	chmod +x /etc/kernel/scripts/piv_pin_helper.sh
 	#endregion
 
-	#region configure openssl 
+	#region Configure the OpenSSL PKCS#11 provider
 	install -d -m 0755 /etc/ssl/openssl.cnf.d
 
 	echo ".include /etc/ssl/openssl.cnf.d/" >> /etc/ssl/openssl.cnf
@@ -484,7 +486,7 @@ target_side_code()
 	EOF
 	#endregion
 
-	#region Setup kernel post install script to prepare and install UKI
+	#region Install the UKI generation hook
 	install -d -m 0755 /etc/kernel/postinst.d
 	cat <<- 'EOF' > /etc/kernel/postinst.d/90-kernel-install
 		#!/bin/sh
@@ -495,7 +497,7 @@ target_side_code()
 	chmod +x /etc/kernel/postinst.d/90-kernel-install
 	#endregion
 
-	#region Setup kernel post install script to update bootloader hints
+	#region Install the fallback boot hints hook
 	cat <<-'PLUGIN' > /etc/kernel/postinst.d/99-hints-update
 		#!/bin/bash
 		cd /boot/efi/EFI/Linux/
@@ -504,11 +506,11 @@ target_side_code()
 	chmod +x /etc/kernel/postinst.d/99-hints-update
 	#endregion
 
-	#remove debian's rogue dracut hook which ignores uki/signing
+	#region Divert Debian's dracut hook to use the UKI generation hook
 	dpkg-divert --local --rename --add /etc/kernel/postinst.d/dracut
 	#endregion
 
-	#region Install kernel, initramfs packages, and UKI generators
+	#region Install the kernel and boot image tools
 		DEBIAN_FRONTEND=noninteractive \
 		apt install -yqq --autoremove --purge  -o Dpkg::Progress-Fancy=1   \
 		plymouth plymouth-themes \
@@ -519,11 +521,11 @@ target_side_code()
 		linux-image-amd64  
 	#endregion
 
-	#region set Plymouth theme to solar
+	#region Select the Plymouth theme
 	plymouth-set-default-theme "$DEFAULT_PLYMOUTH_THEME"
 	#endregion
 
-	#region setup boot mechanisms
+	#region Sign and install the fallback bootloader
 	# UEFIs can be unreliable in many ways so we will install a fallback bootloader in the ESP
 	# that will scan for .CVS files and boot the first one it finds, which will be our UKI.
     # apt install shim-unsigned -yqq --no-install-recommends -o Dpkg::Progress-Fancy=1
@@ -538,18 +540,18 @@ target_side_code()
 
 	#endregion
 
-	#region Install DKMS and test module generation and signing
+	#region Install DKMS and its signing test module
 	apt install -yqq --autoremove --purge  -o Dpkg::Progress-Fancy=1 \
 	 	dkms linux-headers-amd64 \
 	 	dkms-test-dkms
 	#endregion
 
-	#region Install network manager plus system utilities for debugging and maintenance
+	#region Install networking and maintenance tools
 	apt install -yqq --autoremove --purge  -o Dpkg::Progress-Fancy=1 --no-install-recommends \
         network-manager usbutils nano vim iputils-ping network-manager-tui wpasupplicant netctl systemd-resolved tasksel
 	#endregion
 
-	#region Enroll the signing key to the UEFI db and KEK so that it can be used for secureboot and DKMS module signing 
+	#region Enroll Secure Boot db, KEK and PK (PK last)
 	apt install -y --no-install-recommends -o Dpkg::Progress-Fancy=1 efitools uuid-runtime expect
 
 	l_owner_guid=$(uuidgen --random)
@@ -568,12 +570,13 @@ target_side_code()
 	efi-updatevar -f "$PK_AUTH" PK
 	#endregion
 
-	#region Setup a small swapfile
+	#region Create the swapfile
 	fallocate -l "$DEFAULT_SWAP_SIZE" /swapfile
 	chmod 600 /swapfile
 	mkswap /swapfile
+	#endregion
 
-	#region Prepare TPM enrollment scriplet
+	#region Write the post-boot TPM enrollment helper
 	cat <<- EOF > /root/tpm-enroll.sh
 		#!/bin/bash
 		/usr/bin/systemd-cryptenroll ${p_physical_root_partition} --tpm2-device=auto --tpm2-pcrs="$DEFAULT_TPM_PCRS" --wipe-slot=tpm2  --unlock-fido2-device=auto
@@ -581,7 +584,7 @@ target_side_code()
 	chmod 700 /root/tpm-enroll.sh
 	#endregion
 
-	#region setup homed scriplet
+	#region Write the FIDO2 home creation helper
 	apt install systemd libfido2-1 fido2-tools systemd-homed -y -o Dpkg::Progress-Fancy=1
 	cat <<- EOF > /root/create_homed_user.sh
 		#!/bin/bash
@@ -603,11 +606,11 @@ target_side_code()
 
 }
 
+#endregion
 
-
+#region Cleanup
 cleanup()
 {
- 	#region Unmount target and clean up
 
  	echo "Cleaning up..."
 
@@ -617,12 +620,13 @@ cleanup()
 
  	cryptsetup close "${LUKS_ROOT_DEVICE}"
 
-	#endregion
 
  	exit 0
 }
+#endregion
 
 
+#region Entry point
 trap 'echo "ERROR: Script failed at line $LINENO."; cleanup' SIGINT SIGTERM SIGHUP ERR 
 
 if [ $# -lt 1 ]; then # no arguments, run as host
@@ -636,5 +640,4 @@ else
 		target_side_code "$2"
 	fi
 fi
-
-
+#endregion
