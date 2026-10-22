@@ -1,21 +1,4 @@
 #!/bin/bash
-set -euo pipefail
-
-#region Constants
-# readonly DEFAULT_DISK="/dev/disk/by-id/virtio-target"
-readonly DEFAULT_DISK="/dev/disk/by-id/ata-KINGSTON_RBU-SNS8152S3256GG2_50026B7369011B0A"
-
-readonly DEBIAN_VERSION="forky"
-
-readonly TARGET="/mnt/target"
-readonly SIGNING_CERTIFICATE_DER="/etc/kernel/keys/signing-certificate.der"
-readonly SIGNING_CERTIFICATE_PEM="/etc/kernel/keys/signing-certificate.pem"
-readonly LUKS_ROOT_DEVICE=/dev/mapper/cryptoroot
-readonly CREDENTIALS_DIR="/run/credentials"
-readonly PIV_PIN_KEY_NAME="devoid:piv-pin"
-#endregion
-
-# set -x
 # signing slot is 9c
 # if the YubiKey has a pre-generated key in slot 9c, this will overwrite it without warning, so be careful with this line
 # use only if you haven't generated a key in slot 9c before, or if you don't mind losing the existing key and any certificates associated with it
@@ -24,6 +7,44 @@ readonly PIV_PIN_KEY_NAME="devoid:piv-pin"
 # yubico-piv-tool -s9a -ARSA2048 --pin="$p_PIV_PIN" -averify-pin -agenerate --touch-policy=cached -opub.pem
 # yubico-piv-tool -s9a -S'/CN=luks2-key/OU=voids/O=debian.org/' --pin="$p_PIV_PIN" -averify-pin -aselfsign -ipub.pem -opub.crt
 # yubico-piv-tool -s9a --pin="$p_PIV_PIN" -averify-pin -aimport-certificate -ipub.crt
+
+set -euo pipefail
+# set -x
+
+#region Constants
+# readonly DEFAULT_DISK="/dev/disk/by-id/virtio-target"
+readonly DEFAULT_DISK="/dev/disk/by-id/ata-KINGSTON_RBU-SNS8152S3256GG2_50026B7369011B0A"
+readonly DEBIAN_VERSION="forky"
+readonly DEFAULT_HOSTNAME="devoid-forky"
+readonly TARGET="/mnt/target"
+readonly CREDENTIALS_DIR="/run/credentials"
+
+readonly LUKS_MAPPING_NAME="cryptoroot"
+readonly LUKS_ROOT_DEVICE="/dev/mapper/${LUKS_MAPPING_NAME}"
+readonly ESP_SIZE="2G"
+readonly SWAP_SIZE="8G"
+readonly HOMED_DISK_SIZE="20G"
+readonly TPM_PCRS="7"
+
+readonly YUBIKEY_USB_ID="1050:0407"
+# PKCS#11 object ID 02 identifies the signing key/certificate in PIV slot 9c.
+readonly SIGNING_OBJECT_ID="02"
+readonly PIV_PIN_KEY_NAME="devoid:piv-pin"
+
+readonly KEYS_DIR="/etc/kernel/keys"
+readonly SIGNING_KEY_BASE="${KEYS_DIR}/signing-certificate"
+readonly SIGNING_CERTIFICATE_DER="${SIGNING_KEY_BASE}.der"
+readonly SIGNING_CERTIFICATE_PEM="${SIGNING_KEY_BASE}.pem"
+readonly SIGNING_KEY_ESL="${SIGNING_KEY_BASE}.esl"
+readonly SIGNING_KEY_GUID="${SIGNING_KEY_BASE}.guid"
+# Authenticated update for PK; it is not a generic update for db or KEK.
+readonly PK_AUTH="${SIGNING_KEY_BASE}.auth"
+# Reserved for the service-driver measurements added in a later step.
+readonly SERVICE_DRIVERS_ESL="${KEYS_DIR}/service-drivers.esl"
+
+readonly ZSH_THEME_NAME="risto"
+readonly PLYMOUTH_THEME="solar"
+#endregion
 
 host_side_code()
 {
@@ -55,7 +76,7 @@ host_side_code()
 		(( no_messages += 1 ))
 	fi
 
-	if ! lsusb | grep -q "1050:0407"; then
+	if ! lsusb | grep -q "$YUBIKEY_USB_ID"; then
 		error_message+="\nYubikey not found.\n" >&2
 		(( no_messages += 1 ))
 	fi
@@ -75,7 +96,7 @@ host_side_code()
 	#region Partition the target drive
 	sgdisk --zap-all "${l_disk}"
 	l_efi_system_partition_uuid=$(uuidgen)
-	sgdisk --new=1:2048:+2G  \
+	sgdisk --new=1:2048:+"$ESP_SIZE"  \
 			--typecode=1:ef00 \
 			--change-name=1:"EFI system partition" \
 			--partition-guid=1:"${l_efi_system_partition_uuid}" \
@@ -112,7 +133,7 @@ host_side_code()
 	luks2_pass=$(dialog --keep-tite --insecure --title "LUKS2 recovery" --passwordbox "\nEnter LUKS2 passphrase:" 9 40 2>&1 </dev/tty >/dev/tty)
 	echo -n "$luks2_pass" | cryptsetup luksFormat "$l_physical_root_partition" --type luks2 --batch-mode --key-file=-
 
-	echo -n "$luks2_pass" | cryptsetup open "$l_physical_root_partition" cryptoroot --key-file=-
+	echo -n "$luks2_pass" | cryptsetup open "$l_physical_root_partition" "$LUKS_MAPPING_NAME" --key-file=-
 
 	echo -n "$luks2_pass" | systemd-creds encrypt --name=cryptenroll.passphrase - $CREDENTIALS_DIR/cryptenroll.passphrase
 	unset luks2_pass
@@ -128,7 +149,7 @@ host_side_code()
 	#if no tpm2 token is enrolled, systemd will fail to boot without asking for password, so here's one that will fallback to passphrase
 	systemd-run --pty --wait --collect 	\
 	 			--property="LoadCredentialEncrypted=cryptenroll.passphrase:$CREDENTIALS_DIR/cryptenroll.passphrase" \
-		/usr/bin/systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7 --wipe-slot=tpm2 "$l_physical_root_partition"
+		/usr/bin/systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs="$TPM_PCRS" --wipe-slot=tpm2 "$l_physical_root_partition"
 
 	shred -u "$CREDENTIALS_DIR/cryptenroll.fido2-pin"
 	shred -u "$CREDENTIALS_DIR/cryptenroll.passphrase"
@@ -187,7 +208,7 @@ host_side_code()
 	#endregion
 
 	#region Set hostname
-	l_hostname=$(dialog --keep-tite  --stdout --inputbox "Enter hostname:" 8 50 "devoid-forky")
+	l_hostname=$(dialog --keep-tite  --stdout --inputbox "Enter hostname:" 8 50 "$DEFAULT_HOSTNAME")
 	echo "127.0.1.1 $l_hostname" >> "${TARGET}"/etc/hosts
 	echo "$l_hostname" > "${TARGET}"/etc/hostname
 	#endregion
@@ -303,7 +324,7 @@ target_side_code()
 	sed -i '1i auth	 sufficient	 pam_u2f.so authfile=/etc/u2f_mappings/u2f_keys cue pinverification=1 userpresence=1' /etc/pam.d/login
 
 	sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
-	sed -i 's/ZSH_THEME=".*"/ZSH_THEME="risto"/' ~/.zshrc
+	sed -i "s/ZSH_THEME=\".*\"/ZSH_THEME=\"$ZSH_THEME_NAME\"/" ~/.zshrc
 	chsh -s "$(which zsh)"
 	#endregion
 	
@@ -333,15 +354,13 @@ target_side_code()
 	#endregion
 
 	#region Setup keys for secureboot and DKMS
-	install -d -m 0700 "/etc/kernel/keys"
-	
-	install -d -m 0700 -- "$(dirname -- "$SIGNING_CERTIFICATE_DER")"
+	install -d -m 0700 "$KEYS_DIR"
 
 	touch "$SIGNING_CERTIFICATE_DER"
 
-	pkcs11-tool --module "$g_p11_module" --read-object --type cert --id 02 --output-file "${SIGNING_CERTIFICATE_DER}"
+	pkcs11-tool --module "$g_p11_module" --read-object --type cert --id "$SIGNING_OBJECT_ID" --output-file "${SIGNING_CERTIFICATE_DER}"
 
-	l_signing_private_key_uri=$(pkcs11-tool --module "$g_p11_module" --list-objects --id=02 --type privkey --pin "$piv_pin" | grep -o "pkcs11:.*")
+	l_signing_private_key_uri=$(pkcs11-tool --module "$g_p11_module" --list-objects --id="$SIGNING_OBJECT_ID" --type privkey --pin "$piv_pin" | grep -o "pkcs11:.*")
 
 	openssl x509 -in "${SIGNING_CERTIFICATE_DER}" -outform PEM -out "${SIGNING_CERTIFICATE_PEM}"
 	#endregion
@@ -499,7 +518,7 @@ target_side_code()
 	#endregion
 
 	#region set Plymouth theme to solar
-	plymouth-set-default-theme solar
+	plymouth-set-default-theme "$PLYMOUTH_THEME"
 	#endregion
 
 	#region setup boot mechanisms
@@ -532,30 +551,30 @@ target_side_code()
 	apt install -y --no-install-recommends -o Dpkg::Progress-Fancy=1 efitools uuid-runtime expect
 
 	l_owner_guid=$(uuidgen --random)
-	echo "$l_owner_guid" > $SIGNING_CERTIFICATE_PEM.guid
+	echo "$l_owner_guid" > "$SIGNING_KEY_GUID"
 
-	cert-to-efi-sig-list -g "$l_owner_guid" $SIGNING_CERTIFICATE_PEM $SIGNING_CERTIFICATE_PEM.esl 
+	cert-to-efi-sig-list -g "$l_owner_guid" "$SIGNING_CERTIFICATE_PEM" "$SIGNING_KEY_ESL" 
 
 	# efitools now supports openssl 3.0 providers
 	sign-efi-sig-list -e pkcs11 \
 	-k "$l_signing_private_key_uri" \
 	-c "$SIGNING_CERTIFICATE_PEM" \
-	PK "$SIGNING_CERTIFICATE_PEM.esl" "$SIGNING_CERTIFICATE_PEM.auth"
+	PK "$SIGNING_KEY_ESL" "$PK_AUTH"
 
-	efi-updatevar -e -f $SIGNING_CERTIFICATE_PEM.esl db
-	efi-updatevar -e -f $SIGNING_CERTIFICATE_PEM.esl KEK
-	efi-updatevar -f $SIGNING_CERTIFICATE_PEM.auth PK
+	efi-updatevar -e -f "$SIGNING_KEY_ESL" db
+	efi-updatevar -e -f "$SIGNING_KEY_ESL" KEK
+	efi-updatevar -f "$PK_AUTH" PK
 	#endregion
 
 	#region Setup a small swapfile
-	fallocate -l 8G /swapfile
+	fallocate -l "$SWAP_SIZE" /swapfile
 	chmod 600 /swapfile
 	mkswap /swapfile
 
 	#region Prepare TPM enrollment scriplet
 	cat <<- EOF > /root/tpm-enroll.sh
 		#!/bin/bash
-		/usr/bin/systemd-cryptenroll ${p_physical_root_partition} --tpm2-device=auto --tpm2-pcrs=7 --wipe-slot=tpm2  --unlock-fido2-device=auto
+		/usr/bin/systemd-cryptenroll ${p_physical_root_partition} --tpm2-device=auto --tpm2-pcrs="$TPM_PCRS" --wipe-slot=tpm2  --unlock-fido2-device=auto
 	EOF
 	chmod 700 /root/tpm-enroll.sh
 	#endregion
@@ -570,7 +589,7 @@ target_side_code()
 		  --storage=luks \\
 		  --fido2-device=auto \\
 		  --fs-type=ext4 \\
-		  --disk-size=20G \\
+		  --disk-size=$HOMED_DISK_SIZE \\
 		  --fido2-with-client-pin=yes \\
 		  --fido2-with-user-presence=yes \\
 		  --recovery-key=yes
