@@ -11,20 +11,25 @@
 set -euo pipefail
 # set -x
 
-#region Constants
+#region User-selectable defaults
 # readonly DEFAULT_DISK="/dev/disk/by-id/virtio-target"
 readonly DEFAULT_DISK="/dev/disk/by-id/ata-KINGSTON_RBU-SNS8152S3256GG2_50026B7369011B0A"
-readonly DEBIAN_VERSION="forky"
+readonly DEFAULT_DEBIAN_RELEASE="forky"
 readonly DEFAULT_HOSTNAME="devoid-forky"
+readonly DEFAULT_ESP_SIZE="2G"
+readonly DEFAULT_SWAP_SIZE="8G"
+readonly DEFAULT_HOMED_DISK_SIZE="20G"
+readonly DEFAULT_TPM_PCRS="7"
+readonly DEFAULT_ZSH_THEME="risto"
+readonly DEFAULT_PLYMOUTH_THEME="solar"
+#endregion
+
+#region Internal constants
 readonly TARGET="/mnt/target"
 readonly CREDENTIALS_DIR="/run/credentials"
 
 readonly LUKS_MAPPING_NAME="cryptoroot"
 readonly LUKS_ROOT_DEVICE="/dev/mapper/${LUKS_MAPPING_NAME}"
-readonly ESP_SIZE="2G"
-readonly SWAP_SIZE="8G"
-readonly HOMED_DISK_SIZE="20G"
-readonly TPM_PCRS="7"
 
 readonly YUBIKEY_USB_ID="1050:0407"
 # PKCS#11 object ID 02 identifies the signing key/certificate in PIV slot 9c.
@@ -41,9 +46,6 @@ readonly SIGNING_KEY_GUID="${SIGNING_KEY_BASE}.guid"
 readonly PK_AUTH="${SIGNING_KEY_BASE}.auth"
 # Reserved for the service-driver measurements added in a later step.
 readonly SERVICE_DRIVERS_ESL="${KEYS_DIR}/service-drivers.esl"
-
-readonly ZSH_THEME_NAME="risto"
-readonly PLYMOUTH_THEME="solar"
 #endregion
 
 host_side_code()
@@ -96,7 +98,7 @@ host_side_code()
 	#region Partition the target drive
 	sgdisk --zap-all "${l_disk}"
 	l_efi_system_partition_uuid=$(uuidgen)
-	sgdisk --new=1:2048:+"$ESP_SIZE"  \
+	sgdisk --new=1:2048:+"$DEFAULT_ESP_SIZE"  \
 			--typecode=1:ef00 \
 			--change-name=1:"EFI system partition" \
 			--partition-guid=1:"${l_efi_system_partition_uuid}" \
@@ -149,7 +151,7 @@ host_side_code()
 	#if no tpm2 token is enrolled, systemd will fail to boot without asking for password, so here's one that will fallback to passphrase
 	systemd-run --pty --wait --collect 	\
 	 			--property="LoadCredentialEncrypted=cryptenroll.passphrase:$CREDENTIALS_DIR/cryptenroll.passphrase" \
-		/usr/bin/systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs="$TPM_PCRS" --wipe-slot=tpm2 "$l_physical_root_partition"
+		/usr/bin/systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs="$DEFAULT_TPM_PCRS" --wipe-slot=tpm2 "$l_physical_root_partition"
 
 	shred -u "$CREDENTIALS_DIR/cryptenroll.fido2-pin"
 	shred -u "$CREDENTIALS_DIR/cryptenroll.passphrase"
@@ -192,7 +194,7 @@ host_side_code()
 	#endregion
 
 	#region Debootstrap the base system
-	unshare -m mmdebstrap --mode=root --variant=apt "${DEBIAN_VERSION}" "${TARGET}" \
+	unshare -m mmdebstrap --mode=root --variant=apt "${DEFAULT_DEBIAN_RELEASE}" "${TARGET}" \
 		--components="main contrib non-free non-free-firmware"  \
 		--skip=check/empty 
 	#endregion
@@ -324,7 +326,7 @@ target_side_code()
 	sed -i '1i auth	 sufficient	 pam_u2f.so authfile=/etc/u2f_mappings/u2f_keys cue pinverification=1 userpresence=1' /etc/pam.d/login
 
 	sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
-	sed -i "s/ZSH_THEME=\".*\"/ZSH_THEME=\"$ZSH_THEME_NAME\"/" ~/.zshrc
+	sed -i "s/ZSH_THEME=\".*\"/ZSH_THEME=\"$DEFAULT_ZSH_THEME\"/" ~/.zshrc
 	chsh -s "$(which zsh)"
 	#endregion
 	
@@ -518,7 +520,7 @@ target_side_code()
 	#endregion
 
 	#region set Plymouth theme to solar
-	plymouth-set-default-theme "$PLYMOUTH_THEME"
+	plymouth-set-default-theme "$DEFAULT_PLYMOUTH_THEME"
 	#endregion
 
 	#region setup boot mechanisms
@@ -567,14 +569,14 @@ target_side_code()
 	#endregion
 
 	#region Setup a small swapfile
-	fallocate -l "$SWAP_SIZE" /swapfile
+	fallocate -l "$DEFAULT_SWAP_SIZE" /swapfile
 	chmod 600 /swapfile
 	mkswap /swapfile
 
 	#region Prepare TPM enrollment scriplet
 	cat <<- EOF > /root/tpm-enroll.sh
 		#!/bin/bash
-		/usr/bin/systemd-cryptenroll ${p_physical_root_partition} --tpm2-device=auto --tpm2-pcrs="$TPM_PCRS" --wipe-slot=tpm2  --unlock-fido2-device=auto
+		/usr/bin/systemd-cryptenroll ${p_physical_root_partition} --tpm2-device=auto --tpm2-pcrs="$DEFAULT_TPM_PCRS" --wipe-slot=tpm2  --unlock-fido2-device=auto
 	EOF
 	chmod 700 /root/tpm-enroll.sh
 	#endregion
@@ -589,7 +591,7 @@ target_side_code()
 		  --storage=luks \\
 		  --fido2-device=auto \\
 		  --fs-type=ext4 \\
-		  --disk-size=$HOMED_DISK_SIZE \\
+		  --disk-size=$DEFAULT_HOMED_DISK_SIZE \\
 		  --fido2-with-client-pin=yes \\
 		  --fido2-with-user-presence=yes \\
 		  --recovery-key=yes
