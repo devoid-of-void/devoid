@@ -587,6 +587,17 @@ target_side_code()
 	-c "$SIGNING_CERTIFICATE_PEM" \
 	PK "$SIGNING_KEY_ESL" "$PK_AUTH"
 
+	# Allow writes to existing Secure Boot variables.
+	for l_variable in \
+		db-d719b2cb-3d3a-4596-a3bc-dad00e67656f \
+		KEK-8be4df61-93ca-11d2-aa0d-00e098032b8c \
+		PK-8be4df61-93ca-11d2-aa0d-00e098032b8c
+	do
+		if [[ -e "/sys/firmware/efi/efivars/$l_variable" ]]; then
+			chattr -i "/sys/firmware/efi/efivars/$l_variable"
+		fi
+	done
+
 	efi-updatevar -e -f "$SIGNING_KEY_ESL" db
 	efi-updatevar -a -e -f "$SERVICE_DRIVERS_ESL" db
 	efi-updatevar -e -f "$SIGNING_KEY_ESL" KEK
