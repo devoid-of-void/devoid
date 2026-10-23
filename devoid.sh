@@ -35,6 +35,7 @@ readonly DEFAULT_PLYMOUTH_THEME="solar"
 #region Internal constants
 readonly TARGET="/mnt/target"
 readonly CREDENTIALS_DIR="/run/credentials"
+readonly TPM_EVENT_LOG="/sys/kernel/security/tpm0/binary_bios_measurements"
 
 readonly LUKS_MAPPING_NAME="cryptoroot"
 readonly LUKS_ROOT_DEVICE="/dev/mapper/${LUKS_MAPPING_NAME}"
@@ -52,8 +53,9 @@ readonly SIGNING_KEY_ESL="${SIGNING_KEY_BASE}.esl"
 readonly SIGNING_KEY_GUID="${SIGNING_KEY_BASE}.guid"
 # Authenticated update for PK; it is not a generic update for db or KEK.
 readonly PK_AUTH="${SIGNING_KEY_BASE}.auth"
-# Reserved for the service-driver measurements added in a later step.
-readonly SERVICE_DRIVERS_ESL="${KEYS_DIR}/service-drivers.esl"
+readonly SERVICE_DRIVERS_BASE="${KEYS_DIR}/service-drivers"
+readonly SERVICE_DRIVERS_HASHES="${SERVICE_DRIVERS_BASE}.sha256"
+readonly SERVICE_DRIVERS_ESL="${SERVICE_DRIVERS_BASE}.esl"
 #endregion
 
 #region Host installation
@@ -67,7 +69,7 @@ host_side_code()
 		systemd-cryptsetup systemd-container efibootmgr \
 		yubico-piv-tool ykcs11 \
 		opensc opensc-pkcs11 p11-kit p11-kit-modules pcscd pcsc-tools \
-		tpm2-tools efitools\
+		tpm2-tools efitools yq \
 		libpam-u2f pamu2fcfg expect \
 		gpg
 		# for debugging purposes
@@ -241,6 +243,16 @@ host_side_code()
 	shred -u $CREDENTIALS_DIR/u2f_keys
 	#endregion
 
+	#region Extract service-driver hashes from the host TPM log
+	install -d -m 0700 "${TARGET}${KEYS_DIR}"
+	# Include boot and runtime service drivers, but no EFI applications.
+	tpm2_eventlog "$TPM_EVENT_LOG" | yq -er '
+		[.events[] | select(.EventType | contains("SERVICES_DRIVER"))
+		 | .Digests[] | select(.AlgorithmId == "sha256") | .Digest]
+		| unique[]
+	' > "${TARGET}${SERVICE_DRIVERS_HASHES}"
+	#endregion
+
 	#region Configure Debian inside systemd-nspawn
 	
 	# echo systemd-nspawn  --bind=devoid.sh:/devoid.sh \
@@ -333,7 +345,7 @@ target_side_code()
 	#endregion
 	
 	#region Install Secure Boot and module signing tools
-	apt-get install -y keyutils gnutls-bin openssl mokutil sbsigntool tpm2-tools tpm2-tss libgcrypt20 -o Dpkg::Progress-Fancy=1 
+	apt-get install -y keyutils gnutls-bin openssl mokutil sbsigntool xxd tpm2-tools tpm2-tss libgcrypt20 -o Dpkg::Progress-Fancy=1 
 	#endregion
 
 	#region Cache the PIV PIN for signing
@@ -559,6 +571,16 @@ target_side_code()
 
 	cert-to-efi-sig-list -g "$l_owner_guid" "$SIGNING_CERTIFICATE_PEM" "$SIGNING_KEY_ESL" 
 
+	# sbsiglist takes one binary digest at a time; concatenate the resulting ESLs.
+	l_driver_digest=$(mktemp)
+	while read -r l_driver_hash; do
+		printf '%s' "$l_driver_hash" | xxd -r -p > "$l_driver_digest"
+		sbsiglist --owner "$l_owner_guid" --type sha256 \
+			--output "$l_driver_digest.esl" "$l_driver_digest"
+		cat "$l_driver_digest.esl"
+	done < "$SERVICE_DRIVERS_HASHES" > "$SERVICE_DRIVERS_ESL"
+	rm "$l_driver_digest" "$l_driver_digest.esl"
+
 	# efitools now supports openssl 3.0 providers
 	sign-efi-sig-list -e pkcs11 \
 	-k "$l_signing_private_key_uri" \
@@ -566,6 +588,7 @@ target_side_code()
 	PK "$SIGNING_KEY_ESL" "$PK_AUTH"
 
 	efi-updatevar -e -f "$SIGNING_KEY_ESL" db
+	efi-updatevar -a -e -f "$SERVICE_DRIVERS_ESL" db
 	efi-updatevar -e -f "$SIGNING_KEY_ESL" KEK
 	efi-updatevar -f "$PK_AUTH" PK
 	#endregion
