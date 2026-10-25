@@ -16,7 +16,7 @@
 # /root/tpm-enroll.sh to enroll the TPM against the installed boot state.
 # /root/create_homed_user.sh USER creates a user with a FIDO2-protected home.
 
-set -euo pipefail
+set -Eeuo pipefail
 # set -x
 
 #region User-selectable defaults
@@ -147,6 +147,7 @@ host_side_code()
 	echo -n "$luks2_pass" | cryptsetup luksFormat "$l_physical_root_partition" --type luks2 --batch-mode --key-file=-
 
 	echo -n "$luks2_pass" | cryptsetup open "$l_physical_root_partition" "$LUKS_MAPPING_NAME" --key-file=-
+	l_root_opened=true
 
 	echo -n "$luks2_pass" | systemd-creds encrypt --name=cryptenroll.passphrase - $CREDENTIALS_DIR/cryptenroll.passphrase
 	unset luks2_pass
@@ -183,6 +184,7 @@ host_side_code()
 	# Temporary mountpoint
 	mkdir -p "${TARGET}"
 	mount "${l_root_partition}" "${TARGET}"
+	l_target_mounted=true
 
 	# Persistent directories
 	install -d -m 0755 "${TARGET}/home"
@@ -645,33 +647,43 @@ target_side_code()
 #region Cleanup
 cleanup()
 {
+	local l_status=$? l_cleanup_status=0
 
- 	echo "Cleaning up..."
+	trap - EXIT ERR
+	trap '' HUP INT TERM
+	set +e
 
- 	sync
+	echo "Cleaning up..."
+	if $l_target_mounted; then
+		umount -R "$TARGET" || l_cleanup_status=$?
+	fi
+	if $l_root_opened; then
+		cryptsetup close "$LUKS_MAPPING_NAME" || l_cleanup_status=$?
+	fi
 
- 	[ -d "${TARGET}" ] && umount -R "${TARGET}"
-
- 	cryptsetup close "${LUKS_ROOT_DEVICE}"
-
-
- 	exit 0
+	# Preserve the installation failure, or report a cleanup failure on success.
+	if (( l_status == 0 )); then
+		l_status=$l_cleanup_status
+	fi
+	exit "$l_status"
 }
 #endregion
 
-
 #region Entry point
-trap 'echo "ERROR: Script failed at line $LINENO."; cleanup' SIGINT SIGTERM SIGHUP ERR 
+trap 'printf "ERROR: Script failed at line %s (status %s).\n" "$LINENO" "$?" >&2' ERR
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-if [ $# -lt 1 ]; then # no arguments, run as host
-
-	host_side_code 
-
-	cleanup
-
+if (( $# == 0 )); then
+	l_root_opened=false
+	l_target_mounted=false
+	trap cleanup EXIT
+	host_side_code
+elif [[ $1 == target && $# == 2 ]]; then
+	target_side_code "$2"
 else
-	if [ "$1" = "target" ]; then
-		target_side_code "$2"
-	fi
+	printf 'Usage: %s [target ROOT_PARTITION]\n' "$0" >&2
+	exit 2
 fi
 #endregion
