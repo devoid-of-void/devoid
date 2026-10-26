@@ -46,6 +46,7 @@ readonly SIGNING_OBJECT_ID="02"
 readonly PIV_PIN_KEY_NAME="devoid:piv-pin"
 
 readonly KEYS_DIR="/etc/kernel/keys"
+readonly SIGNING_OPENSSL_CONF="${KEYS_DIR}/openssl-signing.cnf"
 readonly SIGNING_KEY_BASE="${KEYS_DIR}/signing-certificate"
 readonly SIGNING_CERTIFICATE_DER="${SIGNING_KEY_BASE}.der"
 readonly SIGNING_CERTIFICATE_PEM="${SIGNING_KEY_BASE}.pem"
@@ -353,7 +354,6 @@ target_side_code()
 	#region Cache the PIV PIN for signing
 	piv_pin=$(dialog --keep-tite --insecure --title "DKMS signing" --passwordbox "\nEnter PIV PIN:" 9 40 2>&1 </dev/tty >/dev/tty)
 	keyctl add user "$PIV_PIN_KEY_NAME" "$piv_pin" @s
-	export PKCSPIN=$piv_pin
 	#endregion
 
 	#region Configure YubiKey PKCS#11 access
@@ -420,8 +420,11 @@ target_side_code()
 	install -d -m 0755 /etc/dkms
 	cat <<- EOF > /etc/dkms/sign_helper.sh
 		#!/usr/bin/bash
+		set -eu
 
-		export PKCSPIN=\$(/etc/kernel/scripts/piv_pin_helper.sh)
+		PKCSPIN=\$(/etc/kernel/scripts/piv_pin_helper.sh)
+		export PKCSPIN
+		export OPENSSL_CONF="${SIGNING_OPENSSL_CONF}"
 
 		/lib/modules/"\$kernelver"/build/scripts/sign-file "\$1" "\$2" "\$3" "\$4"
 	EOF
@@ -472,12 +475,11 @@ target_side_code()
 	chmod +x /etc/kernel/scripts/piv_pin_helper.sh
 	#endregion
 
-	#region Configure the OpenSSL PKCS#11 provider
-	install -d -m 0755 /etc/ssl/openssl.cnf.d
+	#region Configure OpenSSL for YubiKey signing
+	cat <<- EOF > "$SIGNING_OPENSSL_CONF"
+		.include /etc/ssl/openssl.cnf
 
-	echo ".include /etc/ssl/openssl.cnf.d/" >> /etc/ssl/openssl.cnf
-
-	cat <<- EOF > /etc/ssl/openssl.cnf.d/ykcs11.conf
+		[default]
 		openssl_conf = openssl_init
 
 		[openssl_init]
@@ -502,11 +504,13 @@ target_side_code()
 
 	#region Install the UKI generation hook
 	install -d -m 0755 /etc/kernel/postinst.d
-	cat <<- 'EOF' > /etc/kernel/postinst.d/90-kernel-install
+	cat <<- EOF > /etc/kernel/postinst.d/90-kernel-install
 		#!/bin/sh
 		set -eu
-		export PKCSPIN=$(/etc/kernel/scripts/piv_pin_helper.sh)
-		kernel-install add "$1" "/boot/vmlinuz-$1"
+		PKCSPIN=\$(/etc/kernel/scripts/piv_pin_helper.sh)
+		export PKCSPIN
+		export OPENSSL_CONF="${SIGNING_OPENSSL_CONF}"
+		kernel-install add "\$1" "/boot/vmlinuz-\$1"
 	EOF
 	chmod +x /etc/kernel/postinst.d/90-kernel-install
 	#endregion
@@ -547,6 +551,7 @@ target_side_code()
 
 	install -d -m 755 /boot/efi/EFI/BOOT/
 	
+	OPENSSL_CONF="$SIGNING_OPENSSL_CONF" PKCSPIN="$piv_pin" \
 	/usr/lib/systemd/systemd-sbsign sign --private-key "${l_signing_private_key_uri}" \
 		--certificate "${SIGNING_CERTIFICATE_PEM}" \
 		--private-key-source provider:pkcs11 \
@@ -584,6 +589,7 @@ target_side_code()
 	rm "$l_driver_digest" "$l_driver_digest.esl"
 
 	# efitools now supports openssl 3.0 providers
+	OPENSSL_CONF="$SIGNING_OPENSSL_CONF" PKCSPIN="$piv_pin" \
 	sign-efi-sig-list -e pkcs11 \
 	-k "$l_signing_private_key_uri" \
 	-c "$SIGNING_CERTIFICATE_PEM" \
