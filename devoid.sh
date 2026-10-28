@@ -339,8 +339,15 @@ target_side_code()
 
 	unset root_pass
 
-	sed -i '1i auth	 sufficient	 pam_u2f.so authfile=/etc/u2f_mappings/u2f_keys cue pinverification=1 userpresence=1' /etc/pam.d/su
-	sed -i '1i auth	 sufficient	 pam_u2f.so authfile=/etc/u2f_mappings/u2f_keys cue pinverification=1 userpresence=1' /etc/pam.d/login
+	# su-l has its own authentication stack on newer Debian releases.
+	# Preserve vendor defaults when creating local PAM overrides.
+	local pam_service
+	for pam_service in su su-l login; do
+		if [ ! -e "/etc/pam.d/$pam_service" ]; then
+			cp "/usr/lib/pam.d/$pam_service" "/etc/pam.d/$pam_service"
+		fi
+		sed -i '1i auth sufficient pam_u2f.so authfile=/etc/u2f_mappings/u2f_keys cue pinverification=1 userpresence=1' "/etc/pam.d/$pam_service"
+	done
 
 	sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
 	sed -i "s/ZSH_THEME=\".*\"/ZSH_THEME=\"$DEFAULT_ZSH_THEME\"/" ~/.zshrc
