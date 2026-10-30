@@ -56,8 +56,8 @@ so PCR 7 reflects the installed boot environment. On the installed system,
 authentication path. Root password authentication is also retained through
 the distribution's PAM configuration; this is **not** a token-only login design.
 
-The script also configures a Zstandard-independent XFS root, an 8 GiB
-**swapfile**, a Plymouth theme, and a helper to create a 100 GiB
+The script also configures an XFS root, an 8 GiB **swapfile**,
+a Plymouth theme, and a helper to create a 100 GiB
 FIDO2-protected `systemd-homed` user image with its own recovery key.
 No graphical desktop is selected automatically.
 
