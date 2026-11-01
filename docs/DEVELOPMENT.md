@@ -14,7 +14,7 @@ DKMS signing, boot-entry behavior or homed support.
   paths/identifiers in the constants block. `KEYS_DIR` is
   `/etc/kernel/keys`.
 - Preserve the host/target boundary. The main script is installed and
-  invoked within `systemd-nspawn` as `/devoid.sh target ROOT_PARTITION`.
+  invoked within `systemd-nspawn` as `/devoid.sh target ROOT_PARTITION SIGNING_BACKEND`.
 - Prefer safe validation, failure propagation, scope-limited secrets,
   proper cleanup and verifiable boot output. **Do not** relax
   authorization or store signing keys unencrypted on disk.
@@ -31,6 +31,7 @@ From the repository directory (USER or ROOT; no disk touched):
 ```sh
 bash -n devoid.sh
 bash -n devoid-usb.sh
+python3 -m unittest discover -s tests -v
 ```
 
 If ShellCheck is installed:
@@ -56,13 +57,14 @@ USB variant's generic-initramfs boot on more than one computer.
 ### Current caveats for future work
 
 - Full end-to-end motherboard/firmware test coverage is incomplete.
-- The main secure installer currently checks a fixed YubiKey USB ID,
-  hardcodes several provider and HID paths, and has an unsafe
+- The main secure installer currently checks fixed backend-specific USB IDs,
+  assumes Debian provider/module layouts, and has an unsafe
   machine-specific default disk. These are **not** portability promises.
 - Installing the PK last is intentional, but transactionality and
   firmware recovery are not implemented.
-- The OpenPGP/Scute Token2 signing guide is a tested EFI proof of
-  concept, **not yet merged into the main PIV/UKI/DKMS implementation**.
+- Token2 integration has syntax and mocked wrapper tests. Its hardware
+  verification and recovery plan is in [the backend guide](token2-installer.md);
+  the prior standalone EFI experiment does not establish these results.
 - A long-term goal is safer key lifecycle/recovery and improved
   testability **without weakening** the trust design.
 

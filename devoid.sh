@@ -1,14 +1,14 @@
 #!/bin/bash
 # devoid installs an opinionated Debian system with an encrypted XFS root,
-# YubiKey-assisted unlocking and login, and signed unified kernel images (UKIs).
+# FIDO2-assisted unlocking and login, and signed unified kernel images (UKIs).
 #
 # Run from a Debian live environment booted in UEFI mode, with network access,
-# a TPM 2.0 and a configured FIDO2/PIV YubiKey. Secure Boot key enrollment
-# requires firmware Setup Mode and an existing signing key and certificate
-# in the YubiKey's PIV slot 9c.
+# a TPM 2.0 and a configured FIDO2 key. Secure Boot key enrollment requires
+# firmware Setup Mode and a provisioned YubiKey PIV or Token2 OpenPGP signing
+# identity. See docs/token2-installer.md for the OpenPGP certificate setup.
 #
 # Review the defaults below, then run from the directory containing this file:
-#   sudo bash ./devoid.sh
+#   bash ./devoid.sh  # ROOT
 #
 # The selected installation disk will be erased. The script prepares it on
 # the live host, then configures Debian inside a systemd-nspawn container.
@@ -27,6 +27,7 @@ readonly DEFAULT_HOSTNAME="devoid-forky"
 readonly DEFAULT_ESP_SIZE="10G"
 readonly DEFAULT_SWAP_SIZE="8G"
 readonly DEFAULT_HOMED_DISK_SIZE="100G"
+readonly DEFAULT_SIGNING_BACKEND="yubikey-piv"
 readonly DEFAULT_TPM_PCRS="7"
 readonly DEFAULT_ZSH_THEME="risto"
 readonly DEFAULT_PLYMOUTH_THEME="solar"
@@ -41,11 +42,15 @@ readonly LUKS_MAPPING_NAME="cryptoroot"
 readonly LUKS_ROOT_DEVICE="/dev/mapper/${LUKS_MAPPING_NAME}"
 
 readonly YUBIKEY_USB_ID="1050:0407"
+readonly TOKEN2_USB_ID="349e:0014"
 # PKCS#11 object ID 02 identifies the signing key/certificate in PIV slot 9c.
 readonly SIGNING_OBJECT_ID="02"
 readonly PIV_PIN_KEY_NAME="devoid:piv-pin"
 
 readonly KEYS_DIR="/etc/kernel/keys"
+readonly SIGNING_GNUPGHOME="${KEYS_DIR}/gnupg"
+readonly SIGNING_P11_CONFIG="${KEYS_DIR}/pkcs11"
+readonly SIGNING_EXEC="/etc/kernel/scripts/signing-exec"
 readonly SIGNING_OPENSSL_CONF="${KEYS_DIR}/openssl-signing.cnf"
 readonly SIGNING_KEY_BASE="${KEYS_DIR}/signing-certificate"
 readonly SIGNING_CERTIFICATE_DER="${SIGNING_KEY_BASE}.der"
@@ -67,17 +72,31 @@ host_side_code()
 
 	apt install -yqq --no-install-recommends --autoremove --purge -o Dpkg::Progress-Fancy=1 \
 		dialog gdisk uuid-runtime parted dosfstools xfsprogs mmdebstrap cryptsetup \
-		systemd-cryptsetup systemd-container efibootmgr \
-		yubico-piv-tool ykcs11 \
+		systemd-cryptsetup systemd-container efibootmgr openssl usbutils \
 		opensc opensc-pkcs11 p11-kit p11-kit-modules pcscd pcsc-tools \
 		tpm2-tools efitools yq \
 		libpam-u2f pamu2fcfg expect \
 		gpg
 		# for debugging purposes
 		# apt install sshfs fuse openssh-server
-		systemctl enable pcscd
-		systemctl start pcscd
-		dialog --keep-tite  --title "Restarting pcscd" --msgbox "\nPlease replug your YubiKey" 7 60
+	# Choose before any disk writes. Both backends still use FIDO2 for login/unlock.
+	l_signing_backend=$(dialog --stdout --default-item "$DEFAULT_SIGNING_BACKEND" \
+		--menu "Secure Boot signing identity:" 12 72 2 \
+		yubikey-piv "YubiKey PIV slot 9c" \
+		token2-openpgp "Token2 OpenPGP authentication key (Scute)")
+	case "$l_signing_backend" in
+		yubikey-piv) l_signing_usb_id=$YUBIKEY_USB_ID ;;
+		token2-openpgp)
+			l_signing_usb_id=$TOKEN2_USB_ID
+			l_openpgp_certificate=$(dialog --stdout --inputbox \
+				"Path to the PEM X.509 certificate for your Token2 OPENPGP.3 key:" 10 76)
+			# Snapshot and validate the public certificate before partitioning.
+			l_openpgp_pem=$(openssl x509 -in "$l_openpgp_certificate" -outform PEM)
+			;;
+		*) echo "Invalid signing backend" >&2; return 1 ;;
+	esac
+	systemctl enable --now pcscd.socket
+	dialog --keep-tite --title "Signing key" --msgbox "Replug the selected security key." 7 60
 	#endregion
 
 	#region Select the disk and check hardware
@@ -90,8 +109,8 @@ host_side_code()
 		(( no_messages += 1 ))
 	fi
 
-	if ! lsusb | grep -q "$YUBIKEY_USB_ID"; then
-		error_message+="\nYubikey not found.\n" >&2
+	if ! lsusb | grep -q "$l_signing_usb_id"; then
+		error_message+="\nSelected signing token not found.\n" >&2
 		(( no_messages += 1 ))
 	fi
 
@@ -231,7 +250,7 @@ host_side_code()
 
 
 	#region Enroll root's FIDO2 login credential
-	echo "Please touch the YubiKey to enable passwordless root login..."
+	echo "Please touch the FIDO2 key to enable passwordless root login..."
 	expect <<- EOF > $CREDENTIALS_DIR/u2f_keys
 		spawn pamu2fcfg --username=root --origin=pam://$l_hostname --pin-verification
 		expect {
@@ -256,6 +275,10 @@ host_side_code()
 	' > "${TARGET}${SERVICE_DRIVERS_HASHES}"
 	#endregion
 
+	if [[ $l_signing_backend == token2-openpgp ]]; then
+		printf '%s\n' "$l_openpgp_pem" > "${TARGET}${SIGNING_CERTIFICATE_PEM}"
+	fi
+
 	#region Configure Debian inside systemd-nspawn
 	
 	# echo systemd-nspawn  --bind=devoid.sh:/devoid.sh \
@@ -274,6 +297,12 @@ host_side_code()
 	# 				--bind=/sys/firmware/efi/efivars \
 	# 				--property='"DeviceAllow=/dev/bus/usb rwm"' -- > run_cont.sh
 
+	# Bind existing FIDO HID nodes; a Token2 need not expose the YubiKey's two nodes.
+	local l_hidraw
+	local -a l_hidraw_binds=()
+	for l_hidraw in /dev/hidraw*; do
+		[[ ! -c $l_hidraw ]] || l_hidraw_binds+=("--bind=$l_hidraw")
+	done
 	unshare -m systemd-nspawn  --bind=devoid.sh:/devoid.sh \
 					--directory="${TARGET}" \
 					--bind="${l_physical_root_partition}" \
@@ -282,13 +311,13 @@ host_side_code()
 					--console=interactive \
 					--bind-ro=/run/udev \
 					--bind=/dev/bus/usb \
-					--bind=/dev/bus/usb --bind=/dev/hidraw0 --bind=/dev/hidraw1 \
+					"${l_hidraw_binds[@]}" \
 					--bind=/dev/tpm0   \
 					--bind=/dev/tpmrm0 \
 					--bind=/run/pcscd/pcscd.comm \
 					--capability=CAP_SYS_ADMIN \
 					--bind=/sys/firmware/efi/efivars \
-					-- /devoid.sh target "$l_physical_root_partition" 
+					-- /devoid.sh target "$l_physical_root_partition" "$l_signing_backend"
 					# --as-pid2 \
 	#endregion
 
@@ -318,6 +347,8 @@ host_side_code()
 target_side_code()
 {
 	p_physical_root_partition=$1
+	l_signing_backend=$2
+	case "$l_signing_backend" in yubikey-piv|token2-openpgp) ;; *) return 2 ;; esac
 
 	#region Configure locale, timezone and keyboard
 	apt update 
@@ -358,36 +389,42 @@ target_side_code()
 	apt-get install -y keyutils gnutls-bin openssl mokutil sbsigntool xxd tpm2-tools tpm2-tss libgcrypt20 -o Dpkg::Progress-Fancy=1 
 	#endregion
 
-	#region Cache the PIV PIN for signing
-	piv_pin=$(dialog --keep-tite --insecure --title "DKMS signing" --passwordbox "\nEnter PIV PIN:" 9 40 2>&1 </dev/tty >/dev/tty)
-	keyctl add user "$PIV_PIN_KEY_NAME" "$piv_pin" @s
-	#endregion
-
-	#region Configure YubiKey PKCS#11 access
-	apt install --no-install-recommends -y -o Dpkg::Progress-Fancy=1  \
-		yubico-piv-tool p11-kit p11-kit-modules opensc ykcs11 \
-		opensc-pkcs11 pcscd pcsc-tools libengine-pkcs11-openssl pkcs11-provider 
-
-	# get the path to the YubiKey PKCS#11 module, which is needed for enrolling the YubiKey for LUKS2 unlocking
-	g_p11_module=$(dpkg -L ykcs11 | grep 'libykcs11.so$')
-
-	install -d -m 0755 /usr/share/p11-kit/modules
-	cat <<- EOF > /usr/share/p11-kit/modules/ykcs11.module
-		module: $g_p11_module
-		label: YubiKey PIV
-	EOF
-	#endregion
-
-	#region Read the signing certificate and private-key URI
+	#region Configure the selected signing identity
 	install -d -m 0700 "$KEYS_DIR"
+	install -d -m 0755 /etc/kernel/scripts
+	apt-get install --no-install-recommends -y p11-kit p11-kit-modules opensc \
+		pcscd pkcs11-provider util-linux
 
-	touch "$SIGNING_CERTIFICATE_DER"
-
-	pkcs11-tool --module "$g_p11_module" --read-object --type cert --id "$SIGNING_OBJECT_ID" --output-file "${SIGNING_CERTIFICATE_DER}"
-
-	l_signing_private_key_uri=$(pkcs11-tool --module "$g_p11_module" --list-objects --id="$SIGNING_OBJECT_ID" --type privkey --pin "$piv_pin" | grep -o "pkcs11:.*")
-
-	openssl x509 -in "${SIGNING_CERTIFICATE_DER}" -outform PEM -out "${SIGNING_CERTIFICATE_PEM}"
+	if [[ $l_signing_backend == yubikey-piv ]]; then
+		apt-get install --no-install-recommends -y yubico-piv-tool ykcs11
+		g_p11_module=$(dpkg -L ykcs11 | grep '/libykcs11.so$')
+		piv_pin=$(dialog --keep-tite --insecure --title "Signing" --passwordbox "Enter PIV PIN:" 9 40 2>&1 </dev/tty >/dev/tty)
+		keyctl add user "$PIV_PIN_KEY_NAME" "$piv_pin" @s
+		pkcs11-tool --module "$g_p11_module" --read-object --type cert \
+			--id "$SIGNING_OBJECT_ID" --output-file "$SIGNING_CERTIFICATE_DER"
+		l_signing_private_key_uri=$(pkcs11-tool --module "$g_p11_module" --list-objects \
+			--id="$SIGNING_OBJECT_ID" --type privkey --pin "$piv_pin" | grep -o 'pkcs11:.*')
+		unset piv_pin
+		openssl x509 -inform DER -in "$SIGNING_CERTIFICATE_DER" -out "$SIGNING_CERTIFICATE_PEM"
+	else
+		apt-get install --no-install-recommends -y gnupg gpgsm scdaemon scute pinentry-curses
+		install -d -m 0700 "$SIGNING_GNUPGHOME" "$SIGNING_P11_CONFIG/modules"
+		# Use the host PC/SC socket inside nspawn; never compete for direct CCID access.
+		printf 'disable-ccid\n' > "$SIGNING_GNUPGHOME/scdaemon.conf"
+		printf 'pinentry-program /usr/bin/pinentry-curses\ndefault-cache-ttl 0\nmax-cache-ttl 0\n' > "$SIGNING_GNUPGHOME/gpg-agent.conf"
+		# Stop this dedicated agent when the target phase exits (also on errors).
+		trap 'GNUPGHOME="$SIGNING_GNUPGHOME" gpgconf --kill all || true' EXIT
+		GNUPGHOME="$SIGNING_GNUPGHOME" gpg --card-status
+		GNUPGHOME="$SIGNING_GNUPGHOME" gpgsm --import "$SIGNING_CERTIFICATE_PEM"
+		openssl x509 -in "$SIGNING_CERTIFICATE_PEM" -outform DER -out "$SIGNING_CERTIFICATE_DER"
+		l_scute_module=$(dpkg -L scute | grep '/scute.so$')
+		[[ -f $l_scute_module && $l_scute_module != *$'\n'* ]]
+		g_p11_module=$(dpkg -L p11-kit-modules | grep '/p11-kit-proxy.so$')
+		printf 'module: %s\nmanaged: yes\ncritical: yes\n' "$l_scute_module" > "$SIGNING_P11_CONFIG/modules/scute.module"
+		printf 'user-config: none\n' > "$SIGNING_P11_CONFIG/pkcs11.conf"
+		install -d -m 0755 /etc/pkcs11/modules /usr/share/p11-kit/modules
+	fi
+	[[ -f $g_p11_module && $g_p11_module != *$'\n'* ]]
 	#endregion
 
 	#region Configure UKI and initramfs generation
@@ -413,27 +450,13 @@ target_side_code()
  	echo 'g tss -' >> /etc/sysusers.d/tpm2-tss.conf
 	#endregion
 
-	#region Configure DKMS module signing
-	install -d -m 0755 /etc/dkms/framework.conf.d
-
-	cat <<- EOF > /etc/dkms/framework.conf.d/signing.conf
-		mok_signing_key="${l_signing_private_key_uri}"
-		mok_certificate="${SIGNING_CERTIFICATE_DER}"
-		sign_file="/etc/dkms/sign_helper.sh"
-	EOF
-	#endregion
-
 	#region Write the DKMS signing helper
 	install -d -m 0755 /etc/dkms
 	cat <<- EOF > /etc/dkms/sign_helper.sh
 		#!/usr/bin/bash
 		set -eu
 
-		PKCSPIN=\$(/etc/kernel/scripts/piv_pin_helper.sh)
-		export PKCSPIN
-		export OPENSSL_CONF="${SIGNING_OPENSSL_CONF}"
-
-		/lib/modules/"\$kernelver"/build/scripts/sign-file "\$1" "\$2" "\$3" "\$4"
+		exec "${SIGNING_EXEC}" /lib/modules/"\$kernelver"/build/scripts/sign-file "\$1" "\$2" "\$3" "\$4"
 	EOF
 	chmod +x /etc/dkms/sign_helper.sh
 	#endregion
@@ -443,32 +466,15 @@ target_side_code()
 	cp  "${SIGNING_CERTIFICATE_DER}" "/boot/efi/EFI/secureboot/mok-cert.der"
 	#endregion
 
-	#region Configure UKI signing with the YubiKey
-	install -d -m 0755 /etc/kernel
-	cat <<- EOF > /etc/kernel/uki.conf
-		[UKI]
-		SecureBootSigningTool=systemd-sbsign
-		SigningProvider=pkcs11
-		SignKernel=false
-		SecureBootPrivateKey=${l_signing_private_key_uri}
-		SecureBootCertificate=${SIGNING_CERTIFICATE_PEM}
-		Cmdline=@/etc/kernel/cmdline
-
-		# Optional: also for PCR signing (Measured Boot)
-		# [PCRSignature:initrd]
-		# PCRPrivateKey=pkcs11:object=Private key for Digital Signature;type=private
-		# Phases=enter-initrd		
-	EOF
-	#endregion
-
 	#region Write the PIV PIN cache helper
 	install -d -m 0755 /etc/kernel/scripts
 	cat <<- EOF > /etc/kernel/scripts/piv_pin_helper.sh
 		#!/usr/bin/bash
 
+		set -eu
 		KEY_NAME=${PIV_PIN_KEY_NAME}
 
-		KEY_ID=\$(keyctl search @s user "\$KEY_NAME" 2>/dev/null)
+		KEY_ID=\$(keyctl search @s user "\$KEY_NAME" 2>/dev/null || true)
 
 		if [[ -z "\$KEY_ID" ]]; then
 			
@@ -482,30 +488,98 @@ target_side_code()
 	chmod +x /etc/kernel/scripts/piv_pin_helper.sh
 	#endregion
 
-	#region Configure OpenSSL for YubiKey signing
+	#region Isolated signing provider and command wrapper
 	cat <<- EOF > "$SIGNING_OPENSSL_CONF"
-		.include /etc/ssl/openssl.cnf
-
-		[default]
 		openssl_conf = openssl_init
-
 		[openssl_init]
 		providers = provider_sect
-
 		[provider_sect]
 		default = default_sect
 		pkcs11 = pkcs11_sect
-
 		[default_sect]
 		activate = 1
-
 		[pkcs11_sect]
-		module = /usr/lib/x86_64-linux-gnu/ossl-modules/pkcs11.so
-		pkcs11-module-cache-pins = cache
-		pkcs11-module-login-behavior = auto
-		#pkcs11-module-cache-sessions = 5
-		pkcs11-module-token-pin = \$ENV::PKCSPIN
-		activate=1
+		pkcs11-module-path = $g_p11_module
+		activate = 1
+	EOF
+	if [[ $l_signing_backend == yubikey-piv ]]; then
+		printf 'pkcs11-module-token-pin = $ENV::PKCSPIN\n' >> "$SIGNING_OPENSSL_CONF"
+	fi
+	cat <<- EOF > "$SIGNING_EXEC"
+		#!/bin/bash
+		set -euo pipefail
+		# Generated backend settings; never export these in a login profile.
+		backend='$l_signing_backend'
+		export OPENSSL_CONF='$SIGNING_OPENSSL_CONF'
+		export PKCS11_PROVIDER_MODULE='$g_p11_module'
+		if [[ \$backend == yubikey-piv ]]; then
+			PKCSPIN=\$(/etc/kernel/scripts/piv_pin_helper.sh)
+			export PKCSPIN
+			export KBUILD_SIGN_PIN="\$PKCSPIN"
+		else
+			unset PKCSPIN KBUILD_SIGN_PIN
+			export GNUPGHOME='$SIGNING_GNUPGHOME'
+			if [[ \${1:-} != --private-namespace ]]; then
+				exec unshare --mount --propagation private -- "\$0" --private-namespace "\$@"
+			fi
+			shift
+			# Root p11-kit ignores per-user config on recent releases. Bind the
+			# Scute-only configuration inside this command's private namespace.
+			mount --bind '$SIGNING_P11_CONFIG' /etc/pkcs11
+			mount --bind '$SIGNING_P11_CONFIG/modules' /usr/share/p11-kit/modules
+			if [[ -t 2 ]]; then
+				GPG_TTY=\$(tty <&2)
+				export GPG_TTY
+				gpg-connect-agent updatestartuptty /bye >/dev/null
+			fi
+		fi
+		exec "\$@"
+	EOF
+	chmod 0755 "$SIGNING_EXEC"
+	if [[ $l_signing_backend == token2-openpgp ]]; then
+		l_signing_private_key_uri=$("$SIGNING_EXEC" pkcs11-tool --module "$g_p11_module" \
+			--list-objects --type privkey | grep -o 'pkcs11:.*')
+	fi
+	# Fail closed on missing/ambiguous identities, before installing any boot hooks.
+	[[ $l_signing_private_key_uri == pkcs11:* && $l_signing_private_key_uri != *$'\n'* ]]
+	# URI is embedded in DKMS shell configuration: reject shell metacharacters.
+	[[ $l_signing_private_key_uri != *['"`$\']* ]]
+	"$SIGNING_EXEC" openssl storeutl -keys -noout "$l_signing_private_key_uri"
+	# Prove that the selected private key matches the certificate to enroll.
+	head -c 32 /dev/urandom > "$KEYS_DIR/signing-test.data"
+	"$SIGNING_EXEC" openssl dgst -sha256 -sign "$l_signing_private_key_uri" \
+		-out "$KEYS_DIR/signing-test.sig" "$KEYS_DIR/signing-test.data"
+	openssl x509 -in "$SIGNING_CERTIFICATE_PEM" -pubkey -noout > "$KEYS_DIR/signing-test.pub"
+	openssl dgst -sha256 -verify "$KEYS_DIR/signing-test.pub" \
+		-signature "$KEYS_DIR/signing-test.sig" "$KEYS_DIR/signing-test.data"
+	rm "$KEYS_DIR"/signing-test.{data,sig,pub}
+	#endregion
+
+	#region Configure UKI signing with the selected token
+	install -d -m 0755 /etc/kernel
+	cat <<- EOF > /etc/kernel/uki.conf
+		[UKI]
+		SecureBootSigningTool=systemd-sbsign
+		SigningProvider=pkcs11
+		SignKernel=false
+		SecureBootPrivateKey=${l_signing_private_key_uri}
+		SecureBootCertificate=${SIGNING_CERTIFICATE_PEM}
+		Cmdline=@/etc/kernel/cmdline
+
+		# Optional: also for PCR signing (Measured Boot)
+		# [PCRSignature:initrd]
+		# PCRPrivateKey=pkcs11:object=Private key for Digital Signature;type=private
+		# Phases=enter-initrd
+	EOF
+	#endregion
+
+	#region Configure DKMS module signing
+	install -d -m 0755 /etc/dkms/framework.conf.d
+
+	cat <<- EOF > /etc/dkms/framework.conf.d/signing.conf
+		mok_signing_key="${l_signing_private_key_uri}"
+		mok_certificate="${SIGNING_CERTIFICATE_DER}"
+		sign_file="/etc/dkms/sign_helper.sh"
 	EOF
 	#endregion
 
@@ -514,10 +588,7 @@ target_side_code()
 	cat <<- EOF > /etc/kernel/postinst.d/90-kernel-install
 		#!/bin/sh
 		set -eu
-		PKCSPIN=\$(/etc/kernel/scripts/piv_pin_helper.sh)
-		export PKCSPIN
-		export OPENSSL_CONF="${SIGNING_OPENSSL_CONF}"
-		kernel-install add "\$1" "/boot/vmlinuz-\$1"
+		exec "${SIGNING_EXEC}" kernel-install add "\$1" "/boot/vmlinuz-\$1"
 	EOF
 	chmod +x /etc/kernel/postinst.d/90-kernel-install
 	#endregion
@@ -558,11 +629,11 @@ target_side_code()
 
 	install -d -m 755 /boot/efi/EFI/BOOT/
 	
-	OPENSSL_CONF="$SIGNING_OPENSSL_CONF" PKCSPIN="$piv_pin" \
-	/usr/lib/systemd/systemd-sbsign sign --private-key "${l_signing_private_key_uri}" \
+	"$SIGNING_EXEC" /usr/lib/systemd/systemd-sbsign sign --private-key "${l_signing_private_key_uri}" \
 		--certificate "${SIGNING_CERTIFICATE_PEM}" \
 		--private-key-source provider:pkcs11 \
 		"$l_fallback" --output /boot/efi/EFI/BOOT/BOOTX64.EFI
+	sbverify --cert "$SIGNING_CERTIFICATE_PEM" /boot/efi/EFI/BOOT/BOOTX64.EFI
 
 	#endregion
 
@@ -596,8 +667,7 @@ target_side_code()
 	rm "$l_driver_digest" "$l_driver_digest.esl"
 
 	# efitools now supports openssl 3.0 providers
-	OPENSSL_CONF="$SIGNING_OPENSSL_CONF" PKCSPIN="$piv_pin" \
-	sign-efi-sig-list -e pkcs11 \
+	"$SIGNING_EXEC" sign-efi-sig-list -e pkcs11 \
 	-k "$l_signing_private_key_uri" \
 	-c "$SIGNING_CERTIFICATE_PEM" \
 	PK "$SIGNING_KEY_ESL" "$PK_AUTH"
@@ -693,10 +763,10 @@ if (( $# == 0 )); then
 	l_target_mounted=false
 	trap cleanup EXIT
 	host_side_code
-elif [[ $1 == target && $# == 2 ]]; then
-	target_side_code "$2"
+elif [[ $1 == target && $# == 3 ]]; then
+	target_side_code "$2" "$3"
 else
-	printf 'Usage: %s [target ROOT_PARTITION]\n' "$0" >&2
+	printf 'Usage: %s [target ROOT_PARTITION SIGNING_BACKEND]\n' "$0" >&2
 	exit 2
 fi
 #endregion

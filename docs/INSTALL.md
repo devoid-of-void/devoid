@@ -8,7 +8,7 @@ This guide describes the `progressive-refactor` branch, not a universal installe
 
 Before starting, back up all data and confirm that the backup restores on another machine. Record the firmware Secure Boot state, existing `PK`/`KEK`/`db`/`dbx`, and boot entries if your firmware permits; learn how to restore factory keys or enter recovery mode. Changing Secure Boot keys can prevent other operating systems, option ROMs and installation media from booting.
 
-Provision a supported YubiKey with a **PIV slot 9c** signing key and certificate (PKCS#11 object ID `02`), signing PIN, and token-enforced touch confirmation. Configure its FIDO2 PIN as well. PIV and FIDO2 are separate key applications with different PIN domains. The current code checks USB ID `1050:0407`: other keys are not supported without changing the installer and validating the PKCS#11 stack.
+Provision either a YubiKey PIV slot 9c identity (object ID `02`) or a Token2 OpenPGP authentication key with its matching PEM X.509 certificate. Configure FIDO2 separately. The installer offers the signing choice before disk writes; see [backend setup](token2-installer.md) for supported devices, PIN handling and hardware validation.
 
 Plan to record two independent secrets: the **root LUKS2 recovery passphrase** and the generated **root password**. If you later create a `systemd-homed` user, it has a *third*, separate recovery key. The Secure Boot signing private key is intended to be nonexportable; loss of the token can make future signed kernel updates impossible without an alternative trust-recovery plan.
 
@@ -68,7 +68,7 @@ From the directory containing `devoid.sh`, as **ROOT**:
 bash ./devoid.sh
 ```
 
-Follow disk, hostname, LUKS, FIDO2 and PIV prompts. Be ready for repeated PIN entry and physical touches. The installer creates the GPT, FAT32 ESP, LUKS2 root and XFS filesystem; installs Debian via `mmdebstrap`; then configures boot/signing/PAM via `systemd-nspawn`.
+Follow disk, hostname, LUKS, FIDO2 and selected signing-backend prompts. Be ready for repeated PIN entry and physical touches. The installer creates the GPT, FAT32 ESP, LUKS2 root and XFS filesystem; installs Debian via `mmdebstrap`; then configures boot/signing/PAM via `systemd-nspawn`.
 
 The target phase signs UKIs and fallback bootloader, prepares module-signing hooks, extracts SHA-256 digests of measured EFI service drivers from the **live host's** TPM event log, and enrolls the owner's Secure Boot certificate and driver digests. It updates `db` and `KEK` before `PK` (last). The host phase then deletes almost all current firmware boot entries (preserving only entries containing “debugging”) and installs a new one.
 
@@ -76,7 +76,7 @@ There is no transaction or reliable rollback for firmware operations. It may als
 
 ## 5. First boot and TPM enrollment
 
-Boot the new Debian system with Secure Boot enabled. Keep the YubiKey **and the independent LUKS recovery passphrase** available.
+Boot the new Debian system with Secure Boot enabled. Keep the FIDO2 key **and the independent LUKS recovery passphrase** available.
 
 Run the generated helper as **ROOT**:
 
@@ -94,7 +94,7 @@ Check all critical paths independently, before storing valuable data:
 - Expected UKIs in `/boot/efi/EFI/Linux/` and the signed fallback `/boot/efi/EFI/BOOT/BOOTX64.EFI`.
 - `findmnt / /boot/efi`, `lsblk -f` and `swapon --show`.
 - Root unlocking by TPM, FIDO2 **and** the recovery passphrase, with a working rescue plan.
-- PAM login and both `su` and `su -` using the YubiKey (PIN and touch), and the preserved root password fallback.
+- PAM login and both `su` and `su -` using the FIDO2 key (PIN and touch), and the preserved root password fallback.
 - DKMS module signing after a kernel change; firmware and provider compatibility are not guaranteed by a syntax check.
 
 ## Optional encrypted home

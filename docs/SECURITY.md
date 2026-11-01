@@ -12,7 +12,7 @@ specific owner-controlled signing and encryption arrangement.
 | --- | --- | --- |
 | Owner Secure Boot `PK`, `KEK` and `db` | Firmware loads images trusted by the owner's key policy | Safety of trusted images or invulnerability of firmware |
 | Signed UKIs | Signed kernel, initramfs and command line are in one bootable image | Integrity of arbitrary user-space files or protection after boot |
-| YubiKey PIV signing key | Signing authority stays on-token; PIN/touch can gate its use | Protection if a token accepts PIN-only signing or a trusted signer is malicious |
+| Selected PIV/OpenPGP signing key | Signing authority stays on-token; PIN/touch can gate its use | Protection if a token accepts PIN-only signing or a trusted signer is malicious |
 | LUKS2 encrypted root | Confidentiality at rest when locked, subject to passphrase/key security | Confidentiality after mounting or authentication of all disk sectors |
 | TPM2 policy on PCR 7 | Auto-unlock bound to measured Secure Boot state | Complete filesystem measurement; guaranteed protection if firmware is broken |
 | FIDO2 enrollment | Additional physical-token root unlock method | Recovery from a lost/reset token without separate passphrase |
@@ -90,8 +90,8 @@ environment: unrelated OpenSSL consumers, including Node/Codex, may fail
 or behave unexpectedly when the expected provider/PIN environment is
 missing.
 
-The current YubiKey PIV integration and the [Token2 OpenPGP/Scute
-experiment](token2-openpgp-secure-boot.md) are distinct. An EFI signing
+The selectable installer backends and the original [Token2 OpenPGP/Scute
+experiment](token2-openpgp-secure-boot.md) have distinct validation coverage. An EFI signing
 proof of concept with Token2 does not validate production UKI, DKMS,
 firmware enrollment or recovery on this branch.
 
@@ -107,3 +107,10 @@ Never publish PINs, passphrases, recovery keys or private NetworkManager
 connections. Disk serials and token identifiers in logs are also
 potentially identifying. See [RECOVERY.md](RECOVERY.md) for manual
 access to encrypted data.
+
+## Selectable Token2 integration
+
+This branch adds Token2 as an installer backend. It does not establish
+physical-touch enforcement for OpenPGP or inherit the hardware validation
+coverage of the standalone EFI experiment. See [the backend guide](token2-installer.md)
+for root-agent isolation, scoped configuration and the required recovery tests.

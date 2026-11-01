@@ -356,7 +356,14 @@ gpgsm --list-secret-keys
 
 Then run `gpgsm --delete-keys` with **that certificate's** fingerprint; never use an unverified fingerprint copied from someone else's example. Avoid blindly deleting `~/.gnupg/private-keys-v1.d/` entries: they can contain hardware-key references used by other workflows.
 
-## Before integrating this into `devoid.sh`
+## Integration follow-up
+
+This branch implements selectable signing in `devoid.sh`; see
+[the integration guide](token2-installer.md). The following records the
+requirements identified after the original experiment; it does not describe
+the current branch implementation.
+
+### Requirements identified by the original experiment
 
 This is a working proof of concept, not yet a drop-in replacement for the installer's existing YubiKey/PIV signing path. Production integration still needs:
 

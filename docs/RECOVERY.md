@@ -83,13 +83,13 @@ that the new PCR measurement should be trusted. It wipes/replaces
 the previous TPM token; do not re-enroll blindly after a suspected
 compromise. Keep another working LUKS unlock method.
 
-## 3. Lost YubiKey or unusable PIV signing key
+## 3. Lost token or unusable signing key
 
 **Root data:** the LUKS recovery passphrase should still unlock the
 volume using the procedure above if the LUKS header and data are
-intact. The PIV signing key and root LUKS passphrase are different.
+intact. The PIV/OpenPGP signing key and root LUKS passphrase are different.
 
-**Trusted boot and updates:** if the PIV signing key is truly lost
+**Trusted boot and updates:** if the hardware signing key is truly lost
 and nonexportable, you cannot simply re-sign a UKI with the old
 identity. You need a previously provisioned backup signing identity
 trusted by your firmware, or a carefully planned firmware Setup Mode

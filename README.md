@@ -25,7 +25,7 @@ There are **two deliberately different installers**:
 | Boot | Signed UKIs and signed fallback loader | Unsigned UKIs and systemd-boot |
 | Authentication | FIDO2, recovery passphrase, TPM2 | Password |
 | Firmware | Installs its own Secure Boot db/KEK/PK; rewrites boot entries | Does not enroll keys or change NVRAM boot entries |
-| Intended hardware | Specific YubiKey PIV/FIDO2 + TPM2 + UEFI setup | Bootable USB target, UEFI |
+| Intended hardware | YubiKey PIV or Token2 OpenPGP + FIDO2 + TPM2 + UEFI | Bootable USB target, UEFI |
 | Extras | systemd-homed helper, DKMS signing hook | Generic initramfs, firmware and optional compute repositories |
 
 **Do not use the USB variant as though it provided the security properties of
@@ -42,14 +42,16 @@ UEFI firmware in Setup Mode
                                  ├─ kernel + dracut initramfs + cmdline
                                  └─ LUKS2 root (XFS)
                                       ├─ independent recovery passphrase
-                                      ├─ YubiKey FIDO2 token
+                                      ├─ FIDO2 token
                                       └─ TPM2 token (PCR 7)
                                            └─ /home: optional homed LUKS images
 ```
 
-UKI and DKMS signing use a private key held in a **YubiKey PIV slot 9c**
-(PKCS#11 object ID `02`), with a PIV PIN and touch policy controlled by the
-token. Root LUKS2 is enrolled for FIDO2 and TPM2 unlocking; a separate recovery
+UKI and DKMS signing use a selected hardware identity: **YubiKey PIV slot 9c**
+(PKCS#11 object ID `02`) or **Token2 OpenPGP authentication key** through
+Scute and p11-kit. PIN/touch behavior depends on the backend and token.
+See [signing backend setup and verification](docs/token2-installer.md).
+Root LUKS2 is enrolled for FIDO2 and TPM2 unlocking; a separate recovery
 passphrase remains available. TPM enrollment is repeated **after first boot**
 so PCR 7 reflects the installed boot environment. On the installed system,
 `su`, `su -` and `login` are configured with an additional PAM U2F
@@ -77,15 +79,15 @@ tested. [Architecture](docs/ARCHITECTURE.md) ·
   and recovery from a failed owner-key enrollment. Removing existing keys
   or entering Setup Mode can make the system unbootable.
 - A working TPM 2.0 exposed as `/dev/tpmrm0`.
-- The **specific YubiKey model currently checked by the code**
-  (USB ID `1050:0407`), with FIDO2 PIN and PIV slot 9c provisioned with
-  a usable signing key and X.509 certificate; PIV PIN and touch policy set.
+- A provisioned YubiKey (`1050:0407`, PIV slot 9c) or Token2 Mini
+  (`349e:0014`, OpenPGP authentication slot plus matching PEM certificate).
+  A configured FIDO2 PIN is required with either signing choice.
 - Ability to recover the owner Secure Boot signing identity and independently
   unlock the root LUKS2 volume. See [Recovery](docs/RECOVERY.md).
 
-Token2 OpenPGP signing via Scute is a **separately tested proof of concept**,
-not integrated into this installer or a drop-in replacement for the PIV
-requirement. [Token2 guide](docs/token2-openpgp-secure-boot.md).
+Token2 signing is integrated on this branch. The earlier EFI signing
+experiment was hardware-tested; this installer integration still requires
+the [end-to-end hardware checks](docs/token2-installer.md#verification-and-recovery-test-plan).
 
 ## Installing (secured mode)
 
@@ -93,7 +95,7 @@ Read the [step-by-step guide](docs/INSTALL.md) first. In outline:
 
 1. Back up data **and existing firmware keys/settings**, confirm a firmware
    recovery path, and inspect the selected disk by serial/by-id.
-2. Provision/test the YubiKey's PIV and FIDO2 functions, enter firmware
+2. Provision/test the chosen signing identity and FIDO2 functions, enter firmware
    **Setup Mode**, boot a Debian live environment and connect to the network.
 3. Edit the `DEFAULT_*` block at the top of `devoid.sh`, especially
    `DEFAULT_DISK` and `DEFAULT_DEBIAN_RELEASE`.
@@ -129,7 +131,7 @@ See [post-install checks](docs/INSTALL.md#post-install-verification).
 
 ## Defaults worth reviewing
 
-The current `progressive-refactor` branch defines these at the top of
+This branch, based on `progressive-refactor`, defines these at the top of
 `devoid.sh` (source of truth):
 
 | Setting | Current value |
@@ -139,6 +141,7 @@ The current `progressive-refactor` branch defines these at the top of
 | `DEFAULT_ESP_SIZE` | `10G` |
 | `DEFAULT_SWAP_SIZE` | `8G` |
 | `DEFAULT_HOMED_DISK_SIZE` | `100G` |
+| `DEFAULT_SIGNING_BACKEND` | `yubikey-piv` |
 | `DEFAULT_TPM_PCRS` | `7` |
 | `DEFAULT_ZSH_THEME` | `risto` |
 | `DEFAULT_PLYMOUTH_THEME` | `solar` |
@@ -172,6 +175,7 @@ does **not** protect other important drives. See [USB installation](docs/USB.md)
 - [Security boundaries and firmware hazards](docs/SECURITY.md)
 - [Recovery: broken boot, missing key and LUKS access](docs/RECOVERY.md)
 - [Portable USB variant](docs/USB.md)
+- [Selectable signing backend integration](docs/token2-installer.md)
 - [Token2 OpenPGP-to-PKCS#11 signing experiment](docs/token2-openpgp-secure-boot.md)
 - [Development and verification](docs/DEVELOPMENT.md)
 
