@@ -43,6 +43,7 @@ readonly LUKS_ROOT_DEVICE="/dev/mapper/${LUKS_MAPPING_NAME}"
 
 readonly YUBIKEY_USB_ID="1050:0407"
 readonly TOKEN2_USB_ID="349e:0014"
+readonly TOKEN2_UDEV_RULE="/etc/udev/rules.d/99-devoid-token2-ccid.rules"
 # PKCS#11 object ID 02 identifies the signing key/certificate in PIV slot 9c.
 readonly SIGNING_OBJECT_ID="02"
 readonly PIV_PIN_KEY_NAME="devoid:piv-pin"
@@ -68,6 +69,13 @@ readonly SERVICE_DRIVERS_ESL="${SERVICE_DRIVERS_BASE}.esl"
 host_side_code()
 {
 	#region Prepare the live environment
+	# Remember which host PC/SC units to restore after exclusive Token2 access.
+	local l_pcsc_unit
+	for l_pcsc_unit in pcscd.socket pcscd.service; do
+		if systemctl is-active --quiet "$l_pcsc_unit"; then
+			l_pcsc_restore_units+=("$l_pcsc_unit")
+		fi
+	done
 	apt update
 
 	apt install -yqq --no-install-recommends --autoremove --purge -o Dpkg::Progress-Fancy=1 \
@@ -95,7 +103,13 @@ host_side_code()
 			;;
 		*) echo "Invalid signing backend" >&2; return 1 ;;
 	esac
-	systemctl enable --now pcscd.socket
+	if [[ $l_signing_backend == token2-openpgp ]]; then
+		apt-get install --no-install-recommends -y scdaemon
+		l_pcsc_stopped=true
+		systemctl stop pcscd.socket pcscd.service
+	else
+		systemctl enable --now pcscd.socket
+	fi
 	dialog --keep-tite --title "Signing key" --msgbox "Replug the selected security key." 7 60
 	#endregion
 
@@ -123,6 +137,17 @@ host_side_code()
 		dialog --keep-tite --title "Prerequisite Check Failed" --msgbox "$error_message" $((no_messages * 2 + 5)) 60
 		# reset
 		exit 1
+	fi
+	#endregion
+
+	#region Check Token2 direct CCID access before destructive operations
+	if [[ $l_signing_backend == token2-openpgp ]]; then
+		l_card_probe_dir=$(mktemp -d)
+		# Fresh GnuPG home: no inherited disable-ccid setting or running agent.
+		gpg --homedir "$l_card_probe_dir" --card-status
+		gpgconf --homedir "$l_card_probe_dir" --kill all
+		rm -r -- "$l_card_probe_dir"
+		l_card_probe_dir=""
 	fi
 	#endregion
 
@@ -299,7 +324,13 @@ host_side_code()
 
 	# Bind existing FIDO HID nodes; a Token2 need not expose the YubiKey's two nodes.
 	local l_hidraw
-	local -a l_hidraw_binds=()
+	local -a l_hidraw_binds=() l_card_access=()
+	if [[ $l_signing_backend == token2-openpgp ]]; then
+		# USB nodes are already bind-mounted; also allow their device cgroup.
+		l_card_access+=("--property=DeviceAllow=char-usb_device rw")
+	else
+		l_card_access+=(--bind=/run/pcscd/pcscd.comm)
+	fi
 	for l_hidraw in /dev/hidraw*; do
 		[[ ! -c $l_hidraw ]] || l_hidraw_binds+=("--bind=$l_hidraw")
 	done
@@ -314,7 +345,7 @@ host_side_code()
 					"${l_hidraw_binds[@]}" \
 					--bind=/dev/tpm0   \
 					--bind=/dev/tpmrm0 \
-					--bind=/run/pcscd/pcscd.comm \
+					"${l_card_access[@]}" \
 					--capability=CAP_SYS_ADMIN \
 					--bind=/sys/firmware/efi/efivars \
 					-- /devoid.sh target "$l_physical_root_partition" "$l_signing_backend"
@@ -393,10 +424,10 @@ target_side_code()
 	install -d -m 0700 "$KEYS_DIR"
 	install -d -m 0755 /etc/kernel/scripts
 	apt-get install --no-install-recommends -y p11-kit p11-kit-modules opensc \
-		pcscd pkcs11-provider util-linux
+		pkcs11-provider util-linux
 
 	if [[ $l_signing_backend == yubikey-piv ]]; then
-		apt-get install --no-install-recommends -y yubico-piv-tool ykcs11
+		apt-get install --no-install-recommends -y yubico-piv-tool ykcs11 pcscd
 		g_p11_module=$(dpkg -L ykcs11 | grep '/libykcs11.so$')
 		piv_pin=$(dialog --keep-tite --insecure --title "Signing" --passwordbox "Enter PIV PIN:" 9 40 2>&1 </dev/tty >/dev/tty)
 		keyctl add user "$PIV_PIN_KEY_NAME" "$piv_pin" @s
@@ -409,11 +440,18 @@ target_side_code()
 	else
 		apt-get install --no-install-recommends -y gnupg gpgsm scdaemon scute pinentry-curses
 		install -d -m 0700 "$SIGNING_GNUPGHOME" "$SIGNING_P11_CONFIG/modules"
-		# Use the host PC/SC socket inside nspawn; never compete for direct CCID access.
-		printf 'disable-ccid\n' > "$SIGNING_GNUPGHOME/scdaemon.conf"
+		# Use the same direct CCID path as the tested Token2 setup.
+		# Overwrite the previous branch's disable-ccid setting on a partial target.
+		printf '# Direct CCID access; do not set disable-ccid.\n' > "$SIGNING_GNUPGHOME/scdaemon.conf"
+		# After boot, keep pcscd from claiming this model's CCID interface.
+		# Other PC/SC readers and the Token2 FIDO2 interface remain available.
+		install -d -m 0755 /etc/udev/rules.d
+		printf 'ACTION!="remove|unbind", SUBSYSTEM=="usb", ATTR{idVendor}=="%s", ATTR{idProduct}=="%s", ENV{PCSCLITE_IGNORE}="1"\n' \
+			"${TOKEN2_USB_ID%:*}" "${TOKEN2_USB_ID#*:}" > "$TOKEN2_UDEV_RULE"
 		printf 'pinentry-program /usr/bin/pinentry-curses\ndefault-cache-ttl 0\nmax-cache-ttl 0\n' > "$SIGNING_GNUPGHOME/gpg-agent.conf"
 		# Stop this dedicated agent when the target phase exits (also on errors).
 		trap 'GNUPGHOME="$SIGNING_GNUPGHOME" gpgconf --kill all || true' EXIT
+		GNUPGHOME="$SIGNING_GNUPGHOME" gpgconf --kill all
 		GNUPGHOME="$SIGNING_GNUPGHOME" gpg --card-status
 		GNUPGHOME="$SIGNING_GNUPGHOME" gpgsm --import "$SIGNING_CERTIFICATE_PEM"
 		openssl x509 -in "$SIGNING_CERTIFICATE_PEM" -outform DER -out "$SIGNING_CERTIFICATE_DER"
@@ -737,11 +775,19 @@ cleanup()
 	set +e
 
 	echo "Cleaning up..."
+	if [[ -n $l_card_probe_dir ]]; then
+		gpgconf --homedir "$l_card_probe_dir" --kill all || l_cleanup_status=$?
+		rm -r -- "$l_card_probe_dir" || l_cleanup_status=$?
+	fi
 	if $l_target_mounted; then
 		umount -R "$TARGET" || l_cleanup_status=$?
 	fi
 	if $l_root_opened; then
 		cryptsetup close "$LUKS_MAPPING_NAME" || l_cleanup_status=$?
+	fi
+
+	if $l_pcsc_stopped && (( ${#l_pcsc_restore_units[@]} )); then
+		systemctl start "${l_pcsc_restore_units[@]}" || l_cleanup_status=$?
 	fi
 
 	# Preserve the installation failure, or report a cleanup failure on success.
@@ -761,6 +807,9 @@ trap 'exit 143' TERM
 if (( $# == 0 )); then
 	l_root_opened=false
 	l_target_mounted=false
+	l_card_probe_dir=""
+	l_pcsc_stopped=false
+	l_pcsc_restore_units=()
 	trap cleanup EXIT
 	host_side_code
 elif [[ $1 == target && $# == 3 ]]; then

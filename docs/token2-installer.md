@@ -43,10 +43,22 @@ is not arbitrary-token discovery.
   `/usr/share/p11-kit/modules`. This works for root without relying on
   per-user p11-kit configuration and leaves other programs' module lists
   unchanged. Mount or namespace failures stop signing.
-- Scdaemon uses PC/SC (`disable-ccid`) through the live host's existing
-  socket during nspawn installation, and the installed PC/SC service after
-  boot. This avoids competing direct CCID and PC/SC access. A live user agent
-  already holding the card via direct CCID must release it before installation.
+- Token2 uses scdaemon's direct USB CCID driver, as in the successful hardware
+  experiment. The live host's `pcscd.socket` and `pcscd.service` are stopped
+  during installation; units that were active on entry are restarted during
+  cleanup. A fresh temporary GnuPG home probes card access **before disk
+  erasure**, then its agent is stopped to release the card for the container.
+  A different GnuPG agent holding the card must release it before installation.
+- The Token2 container receives USB device-cgroup access as well as the USB
+  bind mount. It does not require the host PC/SC socket. The PIV backend still
+  uses the PC/SC socket and installs `pcscd` in the target.
+- In the installed system, `99-devoid-token2-ccid.rules` sets
+  `PCSCLITE_IGNORE=1` for USB `349e:0014`. This reserves that model's CCID
+  interface for scdaemon while leaving other PC/SC readers and FIDO2 available.
+  The rule takes effect on boot/device discovery; pcsc-lite 2.3.2 or newer
+  supports it (including the targeted Debian forky/sid packages).
+  See the [PC/SC maintainer's explanation](https://blog.apdu.fr/posts/2025/04/ignore-readers-using-pcsclite_ignore-udev-property/).
+  No host udev rules or global PC/SC masks are installed.
 - The dedicated target agent is stopped when target configuration exits.
   It is started again on demand after boot. Use an interactive root terminal
   for signing and package updates; unattended PIN entry is not implemented.
@@ -71,10 +83,12 @@ python3 -m unittest discover -s tests -v
 Before relying on this integration, test both backend choices on expendable
 hardware with firmware recovery available. The earlier Token2 experiment
 verified `sbsign`/`sbverify`; it did not verify this installer, systemd-sbsign,
-DKMS, PC/SC-in-nspawn, or physical-touch enforcement.
+DKMS, direct CCID-in-nspawn, or physical-touch enforcement.
 
-1. Try a wrong certificate, absent card and cancelled PIN. Confirm the
-   target phase fails before kernel installation/firmware enrollment. Check
+1. Try an absent or inaccessible card. Confirm the host probe fails before
+   partitioning and restores previously active PC/SC units. Then try a wrong
+   certificate and cancelled PIN: the target phase must fail before kernel
+   installation/firmware enrollment. Check
    OpenPGP retry counters; do not repeatedly guess a PIN.
 2. With the correct identity, confirm challenge verification, signed fallback
    and UKI verification, then boot with Secure Boot enabled. Verify db, KEK,
@@ -102,3 +116,16 @@ from a **ROOT** terminal:
 The second command is for the Token2 backend. To change backend on an existing
 installation requires explicit certificate/trust migration; changing the
 source default does not migrate an installed system.
+
+## Card-discovery failure in the first integration
+
+The initial commit forced `disable-ccid` and failed at `gpg --card-status`
+inside nspawn with `No such device`. A fresh GnuPG home on the live host,
+with PC/SC stopped, successfully read the Token2 OpenPGP application and its
+existing authentication key on 1 November 2026. The corrected integration
+therefore uses direct CCID. That host probe confirms card availability;
+it does not by itself validate container access or subsequent signing.
+
+Do not restart a failed installation merely to test card access: the normal
+entry point partitions the disk again. The target phase is also not a general
+resume mechanism; it includes non-idempotent setup operations.

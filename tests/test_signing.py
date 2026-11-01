@@ -118,6 +118,58 @@ exit "${MOUNT_STATUS:-0}"
         self.assertLess(SOURCE.index('l_signing_backend=$(dialog'), SOURCE.index('sgdisk --zap-all'))
         self.assertIn('-- /devoid.sh target "$l_physical_root_partition" "$l_signing_backend"', SOURCE)
 
+    def test_backend_container_transport(self):
+        block = SOURCE.split('local -a l_hidraw_binds=() l_card_access=()\n', 1)[1].split('\tfor l_hidraw', 1)[0]
+        for backend in ['token2-openpgp', 'yubikey-piv']:
+            r = subprocess.run(['bash', '-eu', '-c', 'l_card_access=()\n'+block+'\nprintf "%s\\n" "${l_card_access[@]}"'],
+                               env=dict(self.env, l_signing_backend=backend), capture_output=True, text=True, check=True)
+            if backend == 'token2-openpgp':
+                self.assertEqual(r.stdout.strip(), '--property=DeviceAllow=char-usb_device rw')
+            else:
+                self.assertEqual(r.stdout.strip(), '--bind=/run/pcscd/pcscd.comm')
+
+    def test_card_probe_failure_stops_before_disk_and_restores_host(self):
+        self.check_card_probe(42)
+
+    def test_card_probe_success_releases_agent_and_restores_host(self):
+        self.check_card_probe(0)
+
+    def check_card_probe(self, status):
+        block = SOURCE.split('#region Check Token2 direct CCID access before destructive operations\n', 1)[1].split('\t#endregion', 1)[0]
+        cleanup = 'cleanup()\n{' + SOURCE.split('cleanup()\n{', 1)[1].split('\n#endregion', 1)[0]
+        self.script('gpg', 'printf "probe\\n" >> "$LOG"\nexit "${PROBE_STATUS}"')
+        self.script('gpgconf', 'printf "agent-release\\n" >> "$LOG"')
+        self.script('systemctl', 'printf "systemctl %s\\n" "$*" >> "$LOG"')
+        script = ('set -euo pipefail\n'+cleanup+\
+                  '\nl_root_opened=false; l_target_mounted=false; l_card_probe_dir=""\n' +
+                  'l_pcsc_stopped=true; l_pcsc_restore_units=(pcscd.socket)\n' +
+                  'trap cleanup EXIT\n'+block+'\nprintf "disk-phase\\n" >> "$LOG"\n')
+        r = subprocess.run(['bash', '-c', script],
+                           env=dict(self.env, TMPDIR=str(self.root), PROBE_STATUS=str(status),
+                                    l_signing_backend='token2-openpgp'), capture_output=True, text=True)
+        self.assertEqual(r.returncode, status, r.stderr)
+        log = (self.root/'calls').read_text().splitlines()
+        self.assertEqual('disk-phase' in log, status == 0)
+        self.assertEqual(log.count('agent-release'), 1)
+        self.assertEqual(log[-1], 'systemctl start pcscd.socket')
+        self.assertFalse(list(self.root.glob('tmp.*')))
+
+    def test_target_direct_ccid_configuration(self):
+        block = SOURCE.split('# Use the same direct CCID path as the tested Token2 setup.\n', 1)[1].split("\t\tprintf 'pinentry-program", 1)[0]
+        self.script('install', 'exit 0')
+        gnupg = self.root / 'gnupg'
+        gnupg.mkdir()
+        (gnupg/'scdaemon.conf').write_text('disable-ccid\n')
+        rule = self.root/'token2.rules'
+        subprocess.run(['bash', '-eu', '-c', block], env=dict(self.env,
+                       SIGNING_GNUPGHOME=str(gnupg), TOKEN2_USB_ID='349e:0014',
+                       TOKEN2_UDEV_RULE=str(rule)), check=True)
+        active = [line for line in (gnupg/'scdaemon.conf').read_text().splitlines()
+                  if line.strip() and not line.startswith('#')]
+        self.assertEqual(active, [])
+        self.assertIn('ATTR{idVendor}=="349e", ATTR{idProduct}=="0014"', rule.read_text())
+        self.assertIn('ENV{PCSCLITE_IGNORE}="1"', rule.read_text())
+
 
 if __name__ == '__main__':
     unittest.main()
