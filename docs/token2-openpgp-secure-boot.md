@@ -3,7 +3,7 @@
 A tested way to sign EFI binaries using a Token2 Mini's **OpenPGP** key through **PKCS#11**, **X.509**, and OpenSSL 3. No PIV applet is required.
 
 > [!IMPORTANT]
-> This procedure does **not** convert OpenPGP into PIV or install a PIV applet. It exposes a private key in the OpenPGP authentication slot through Scute's PKCS#11 interface and pairs it with an X.509 certificate. That was sufficient for `sbsign` on the tested system.
+> This procedure does **not** convert OpenPGP into PIV or install a PIV applet. It makes the on-card RSA key in the OpenPGP authentication slot (`OPENPGP.3`) usable for signing through Scute's PKCS#11 interface and pairs it with an X.509 certificate. The private key never leaves the device; Scute forwards signing requests to the card. That was sufficient for `sbsign` on the tested system.
 >
 > The demonstration used a **disposable, self-signed test certificate** and did **not** modify UEFI Secure Boot databases. Do not enroll the test certificate or use an unbacked-up test key as a production signing authority.
 
@@ -129,7 +129,7 @@ gpgsm --list-secret-keys
 
 The listing should show an RSA-2048 certificate and a `card s/n:` referring to the inserted Token2. This associates an X.509 certificate with the hardware-backed private key; it does **not** export that key.
 
-## 3. Confirm Scute exports the X.509 identity
+## 3. Confirm Scute makes the on-card signing key and X.509 certificate available through PKCS#11
 
 Use OpenSC's diagnostic utility, rather than relying on `p11tool` token enumeration:
 
@@ -144,7 +144,7 @@ pkcs11-tool --module "$SCUTE" --list-mechanisms
 We observed:
 
 - A slot identified as `GnuPG Smart Card Daemon`.
-- A **2048-bit RSA private-key object** and matching X.509 certificate, labeled `Scute`.
+- A **2048-bit RSA private-key object** (a reference to the on-card key, not its private key material) and matching X.509 certificate, labeled `Scute`.
 - `RSA-PKCS` (`CKM_RSA_PKCS`) as a hardware signing mechanism.
 - Private-key metadata indicating **never extractable**.
 
@@ -201,7 +201,7 @@ pkcs11-tool --module "$PROXY" --list-slots
 pkcs11-tool --module "$PROXY" --list-objects
 ```
 
-The proxy should enumerate the same Token2 RSA key and certificate as direct Scute access.
+The proxy should enumerate the same PKCS#11 reference to the Token2 RSA key and matching certificate as direct Scute access.
 
 ## 5. Configure an isolated OpenSSL 3 provider environment
 
