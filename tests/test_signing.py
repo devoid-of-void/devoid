@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import re
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -143,6 +144,7 @@ exit "${MOUNT_STATUS:-0}"
         script = ('set -euo pipefail\n'+cleanup+\
                   '\nl_root_opened=false; l_target_mounted=false; l_card_probe_dir=""\n' +
                   'l_pcsc_stopped=true; l_pcsc_restore_units=(pcscd.socket)\n' +
+                  'prepare_openpgp_certificate() { printf certificate > \"$1/signing.pem\"; }\n' +
                   'trap cleanup EXIT\n'+block+'\nprintf "disk-phase\\n" >> "$LOG"\n')
         r = subprocess.run(['bash', '-c', script],
                            env=dict(self.env, TMPDIR=str(self.root), PROBE_STATUS=str(status),
@@ -169,6 +171,110 @@ exit "${MOUNT_STATUS:-0}"
         self.assertEqual(active, [])
         self.assertIn('ATTR{idVendor}=="349e", ATTR{idProduct}=="0014"', rule.read_text())
         self.assertIn('ENV{PCSCLITE_IGNORE}="1"', rule.read_text())
+
+    def certificate_function(self):
+        return 'prepare_openpgp_certificate()\n(' + SOURCE.split('prepare_openpgp_certificate()\n(', 1)[1].split('\n#endregion', 1)[0]
+
+    def test_missing_authentication_key_cannot_generate_certificate(self):
+        self.script('gpgconf', 'exit 0')
+        self.script('gpg-connect-agent', "printf 'S KEYPAIRINFO AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA OPENPGP.1\\nOK\\n'")
+        self.script('gpgsm', 'printf unexpected > "$LOG"; exit 99')
+        work = self.root/'work'
+        work.mkdir(mode=0o700)
+        r = subprocess.run(['bash', '-c', self.certificate_function()+'\nprepare_openpgp_certificate "$1" "$2"',
+                            'test', str(work), str(self.root/'missing-store')], env=self.env,
+                           capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse((self.root/'calls').exists())
+        self.assertFalse((work/'certificate.params').exists())
+
+    def test_certificate_creation_parameters_and_reuse_with_mock_agent(self):
+        work = self.root/'work'
+        work.mkdir(mode=0o700)
+        source = self.root/'source'
+        source.mkdir(mode=0o700)
+        certificate = self.root/'fixture.pem'
+        subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+                        '-subj', '/CN=devoid test', '-days', '1', '-keyout', str(self.root/'fixture.key'),
+                        '-out', str(certificate)], capture_output=True, check=True)
+        grip = 'A'*40
+        self.script('gpgconf', 'exit 0')
+        self.script('gpg-connect-agent', f"printf 'S KEYPAIRINFO {grip} OPENPGP.3\\nOK\\n'")
+        self.script('gpgsm', '''printf '%s\\n' "$*" >> "$LOG"
+case " $* " in
+  *" --list-keys "*)
+    if [[ ${EXISTING_CERT:-0} == 1 ]]; then
+      printf 'crt:::::::::\\nfpr:::::::::BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB:\\ngrp:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:\\n'
+    fi ;;
+  *" --export "*) cat "$FIXTURE_CERT" ;;
+  *" --generate-key "*)
+    while [[ $1 != --output ]]; do shift; done
+    cp "$FIXTURE_CERT" "$2" ;;
+  *" --import "*) ;;
+  *) exit 98 ;;
+esac
+''')
+        command = ['bash', '-c', self.certificate_function()+'\nprepare_openpgp_certificate "$1" "$2"',
+                   'test', str(work), str(source)]
+        env = dict(self.env, FIXTURE_CERT=str(certificate), DEFAULT_SIGNING_CERTIFICATE_YEARS='10')
+        r = subprocess.run(command, env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        params = (work/'certificate.params').read_text()
+        self.assertIn('Key-Grip: '+grip, params)
+        self.assertIn('Key-Usage: sign', params)
+        self.assertIn('Serial: random', params)
+        self.assertIn('Not-After:', params)
+        self.assertEqual((work/'signing.pem').read_bytes(), certificate.read_bytes())
+        (work/'signing.pem').unlink()
+        (work/'certificate.params').unlink()
+        (self.root/'calls').unlink()
+        r = subprocess.run(command, env=dict(env, EXISTING_CERT='1'), capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse((work/'certificate.params').exists())
+        self.assertNotIn('--generate-key', (self.root/'calls').read_text())
+        self.assertEqual((work/'signing.pem').read_bytes(), certificate.read_bytes())
+
+    def test_real_gpgsm_certificate_creation_and_reuse(self):
+        try:
+            probe_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            probe_socket.bind(str(self.root/'agent-socket-probe'))
+            probe_socket.close()
+        except PermissionError:
+            self.skipTest('Environment prohibits Unix sockets required by gpg-agent')
+        # Software key fixture exercises GPGSM's real Key-Grip/batch interface.
+        # No smart card or installer phase is executed.
+        work = self.root/'gnupg-fixture'
+        work.mkdir(mode=0o700)
+        env = dict(self.env, GNUPGHOME=str(work), DEFAULT_SIGNING_CERTIFICATE_YEARS='10')
+        self.addCleanup(lambda: subprocess.run(['gpgconf', '--homedir', str(work), '--kill', 'all'],
+                                              capture_output=True))
+        keygen = subprocess.run(['gpg', '--batch', '--pinentry-mode', 'loopback', '--passphrase', '',
+                        '--quick-generate-key', 'devoid certificate test', 'rsa2048', 'sign', '0'],
+                       env=env, capture_output=True, text=True)
+        self.assertEqual(keygen.returncode, 0, keygen.stderr)
+        listing = subprocess.run(['gpg', '--with-colons', '--with-keygrip', '--list-keys'],
+                                 env=env, capture_output=True, text=True, check=True).stdout
+        grip = next(line.split(':')[9] for line in listing.splitlines() if line.startswith('grp:'))
+        keys_before = sorted((work/'private-keys-v1.d').iterdir())
+        self.script('gpg-connect-agent', f"printf 'S KEYPAIRINFO {grip} OPENPGP.3\\nOK\\n'")
+        command = ['bash', '-c', self.certificate_function()+'\nprepare_openpgp_certificate "$1" "$2"',
+                   'test', str(work), str(self.root/'missing-store')]
+        first = subprocess.run(command, env=env, capture_output=True, text=True)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        cert = (work/'signing.pem').read_bytes()
+        self.assertIn(b'BEGIN CERTIFICATE', cert)
+        self.assertEqual(sorted((work/'private-keys-v1.d').iterdir()), keys_before)
+        params = (work/'certificate.params').read_text()
+        self.assertIn('Key-Grip: '+grip, params)
+        self.assertIn('Serial: random', params)
+        (work/'signing.pem').unlink()
+        (work/'certificate.params').unlink()
+        command[-1] = str(work)
+        second = subprocess.run(command, env=env, capture_output=True, text=True)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual((work/'signing.pem').read_bytes(), cert)
+        self.assertFalse((work/'certificate.params').exists())
+        self.assertIn('Reusing X.509 certificate', second.stderr)
 
 
 if __name__ == '__main__':

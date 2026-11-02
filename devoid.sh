@@ -28,6 +28,7 @@ readonly DEFAULT_ESP_SIZE="10G"
 readonly DEFAULT_SWAP_SIZE="8G"
 readonly DEFAULT_HOMED_DISK_SIZE="100G"
 readonly DEFAULT_SIGNING_BACKEND="yubikey-piv"
+readonly DEFAULT_SIGNING_CERTIFICATE_YEARS="10"
 readonly DEFAULT_TPM_PCRS="7"
 readonly DEFAULT_ZSH_THEME="risto"
 readonly DEFAULT_PLYMOUTH_THEME="solar"
@@ -65,6 +66,69 @@ readonly SERVICE_DRIVERS_HASHES="${SERVICE_DRIVERS_BASE}.sha256"
 readonly SERVICE_DRIVERS_ESL="${SERVICE_DRIVERS_BASE}.esl"
 #endregion
 
+#region Token2 certificate preparation
+# The caller owns the temporary home and releases its agent, including on failure.
+prepare_openpgp_certificate()
+(
+	set -euo pipefail
+	local work_home=$1 source_home=$2 card_info keygrip certificates fingerprint
+	export GNUPGHOME="$work_home"
+	if [[ -t 2 ]]; then
+		GPG_TTY=$(tty <&2)
+		export GPG_TTY
+	fi
+	printf 'pinentry-program /usr/bin/pinentry-curses\n' > "$work_home/gpg-agent.conf"
+	gpgconf --reload gpg-agent
+	card_info=$(gpg-connect-agent 'SCD LEARN --force' /bye)
+	if grep -q '^ERR ' <<< "$card_info"; then
+		printf '%s\n' "$card_info" >&2
+		return 1
+	fi
+	keygrip=$(awk '$1 == "S" && $2 == "KEYPAIRINFO" && $4 == "OPENPGP.3" {print $3}' <<< "$card_info")
+	# Mandatory: never let an empty/missing Key-Grip turn this into key generation.
+	if [[ ! $keygrip =~ ^[[:xdigit:]]{40}$ ]]; then
+		echo 'Token2 needs one existing authentication key in OPENPGP.3; no key was generated.' >&2
+		return 1
+	fi
+
+	# Only inspect the invoking root account's accessible certificate store.
+	# Match keygrips, not names, fingerprints of OpenPGP packets, or card labels.
+	if [[ -d $source_home ]]; then
+		certificates=$(gpgsm --homedir "$source_home" --batch --with-colons --with-keygrip --list-keys "&$keygrip")
+		while IFS= read -r fingerprint; do
+			[[ -n $fingerprint ]] || continue
+			gpgsm --homedir "$source_home" --batch --armor --export "$fingerprint" > "$work_home/candidate.pem"
+			if openssl x509 -in "$work_home/candidate.pem" -checkend 0 -noout >/dev/null; then
+				openssl x509 -in "$work_home/candidate.pem" -out "$work_home/signing.pem"
+				echo "Reusing X.509 certificate $fingerprint for OPENPGP.3." >&2
+				break
+			fi
+		done < <(awk -F: -v grip="$keygrip" '
+			$1 == "crt" {fpr=""}
+			$1 == "fpr" && fpr == "" {fpr=$10}
+			$1 == "grp" && toupper($10) == toupper(grip) {print fpr}
+		' <<< "$certificates")
+	fi
+
+	if [[ ! -s $work_home/signing.pem ]]; then
+		echo 'Creating a self-signed Secure Boot certificate using the existing OPENPGP.3 key.' >&2
+		# Key-Grip reuses the on-card key. Serial requests a certificate, not a CSR.
+		cat <<- EOF > "$work_home/certificate.params"
+			Key-Type: RSA
+			Key-Grip: $keygrip
+			Key-Usage: sign
+			Name-DN: CN=devoid Secure Boot
+			Serial: random
+			Hash-Algo: SHA256
+			Not-After: $(date -u -d "+${DEFAULT_SIGNING_CERTIFICATE_YEARS} years" +%Y%m%dT%H%M%S)
+		EOF
+		gpgsm --batch --armor --output "$work_home/generated.pem" --generate-key "$work_home/certificate.params"
+		openssl x509 -in "$work_home/generated.pem" -out "$work_home/signing.pem"
+	fi
+	gpgsm --batch --import "$work_home/signing.pem"
+)
+#endregion
+
 #region Host installation
 host_side_code()
 {
@@ -96,15 +160,11 @@ host_side_code()
 		yubikey-piv) l_signing_usb_id=$YUBIKEY_USB_ID ;;
 		token2-openpgp)
 			l_signing_usb_id=$TOKEN2_USB_ID
-			l_openpgp_certificate=$(dialog --stdout --inputbox \
-				"Path to the PEM X.509 certificate for your Token2 OPENPGP.3 key:" 10 76)
-			# Snapshot and validate the public certificate before partitioning.
-			l_openpgp_pem=$(openssl x509 -in "$l_openpgp_certificate" -outform PEM)
 			;;
 		*) echo "Invalid signing backend" >&2; return 1 ;;
 	esac
 	if [[ $l_signing_backend == token2-openpgp ]]; then
-		apt-get install --no-install-recommends -y scdaemon
+		apt-get install --no-install-recommends -y scdaemon gpgsm pinentry-curses
 		l_pcsc_stopped=true
 		systemctl stop pcscd.socket pcscd.service
 	else
@@ -145,6 +205,8 @@ host_side_code()
 		l_card_probe_dir=$(mktemp -d)
 		# Fresh GnuPG home: no inherited disable-ccid setting or running agent.
 		gpg --homedir "$l_card_probe_dir" --card-status
+		prepare_openpgp_certificate "$l_card_probe_dir" "${GNUPGHOME:-$HOME/.gnupg}"
+		l_openpgp_pem=$(cat "$l_card_probe_dir/signing.pem")
 		gpgconf --homedir "$l_card_probe_dir" --kill all
 		rm -r -- "$l_card_probe_dir"
 		l_card_probe_dir=""

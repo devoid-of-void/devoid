@@ -8,7 +8,7 @@ This guide describes the `progressive-refactor` branch, not a universal installe
 
 Before starting, back up all data and confirm that the backup restores on another machine. Record the firmware Secure Boot state, existing `PK`/`KEK`/`db`/`dbx`, and boot entries if your firmware permits; learn how to restore factory keys or enter recovery mode. Changing Secure Boot keys can prevent other operating systems, option ROMs and installation media from booting.
 
-Provision either a YubiKey PIV slot 9c identity (object ID `02`) or a Token2 OpenPGP authentication key with its matching PEM X.509 certificate. Configure FIDO2 separately. The installer offers the signing choice before disk writes; see [backend setup](token2-installer.md) for supported devices, PIN handling and hardware validation.
+Provision either a YubiKey PIV slot 9c identity (object ID `02`) or a Token2 OpenPGP authentication key. For Token2, the installer automatically reuses a matching certificate from root’s GPGSM store or creates a self-signed certificate with the existing card key. Configure FIDO2 separately. The installer offers the signing choice before disk writes; see [backend setup](token2-installer.md) for supported devices, PIN handling and hardware validation.
 
 Plan to record two independent secrets: the **root LUKS2 recovery passphrase** and the generated **root password**. If you later create a `systemd-homed` user, it has a *third*, separate recovery key. The Secure Boot signing private key is intended to be nonexportable; loss of the token can make future signed kernel updates impossible without an alternative trust-recovery plan.
 

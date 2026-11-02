@@ -80,7 +80,7 @@ tested. [Architecture](docs/ARCHITECTURE.md) ·
   or entering Setup Mode can make the system unbootable.
 - A working TPM 2.0 exposed as `/dev/tpmrm0`.
 - A provisioned YubiKey (`1050:0407`, PIV slot 9c) or Token2 Mini
-  (`349e:0014`, OpenPGP authentication slot plus matching PEM certificate).
+  (`349e:0014`, OpenPGP authentication slot; certificate prepared automatically).
   A configured FIDO2 PIN is required with either signing choice.
 - Ability to recover the owner Secure Boot signing identity and independently
   unlock the root LUKS2 volume. See [Recovery](docs/RECOVERY.md).
@@ -142,6 +142,7 @@ This branch, based on `progressive-refactor`, defines these at the top of
 | `DEFAULT_SWAP_SIZE` | `8G` |
 | `DEFAULT_HOMED_DISK_SIZE` | `100G` |
 | `DEFAULT_SIGNING_BACKEND` | `yubikey-piv` |
+| `DEFAULT_SIGNING_CERTIFICATE_YEARS` | `10` |
 | `DEFAULT_TPM_PCRS` | `7` |
 | `DEFAULT_ZSH_THEME` | `risto` |
 | `DEFAULT_PLYMOUTH_THEME` | `solar` |

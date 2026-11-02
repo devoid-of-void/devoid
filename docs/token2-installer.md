@@ -8,15 +8,31 @@ The USB installer is unchanged.
 | Choice | Existing identity | PIN handling |
 | --- | --- | --- |
 | YubiKey PIV | Slot 9c, PKCS#11 object ID `02`, on-token X.509 certificate | PIV PIN in the root session keyring |
-| Token2 OpenPGP | RSA-2048 authentication key in `OPENPGP.3`, matching PEM X.509 certificate supplied as a file | OpenPGP User PIN through root's GnuPG agent and terminal pinentry |
+| Token2 OpenPGP | RSA-2048 authentication key in `OPENPGP.3`; certificate discovered or created automatically | OpenPGP User PIN through root's GnuPG agent and terminal pinentry |
 
-Provision the signing identity before installation. For Token2, follow the
-key and certificate steps in the experiment guide, using your intended
-production identity and recovery policy rather than its disposable test
-identity. The installer **does not generate, overwrite or reset card keys**.
-Keep the PEM file accessible in the live environment: the Token2 choice
-asks for its pathname and snapshots the public certificate before disk writes.
-It does not copy the live user's GnuPG directory or private keys.
+Provision the signing key before installation. Token2 needs an existing
+RSA-2048 key in `OPENPGP.3`; the installer does not generate, overwrite or
+reset card keys. No certificate pathname or manual GPGSM procedure is needed.
+
+Before partitioning, the installer discovers the authentication keygrip and
+looks for matching X.509 certificates in the invoking root account's GPGSM
+home (`GNUPGHOME`, or `$HOME/.gnupg`). It reuses the first matching certificate
+that is not expired, in GPGSM listing order. It does not search other users'
+homes or copy their GnuPG directories. If there is no usable certificate,
+it creates a self-signed one using the existing card key, with subject
+`CN=devoid Secure Boot`, SHA-256, random serial and a ten-year validity period
+(configurable via `DEFAULT_SIGNING_CERTIFICATE_YEARS`). GPGSM's batch
+`Key-Grip` parameter selects the existing key; a missing or ambiguous
+`OPENPGP.3` key stops the installer before certificate creation or disk erasure.
+
+The certificate is prepared in the temporary root GnuPG home used by the
+card probe. Certificate creation may prompt for the OpenPGP User PIN and any
+configured authentication-slot touch confirmation. Only the public certificate
+is transferred into the target's dedicated root store; no key bytes are copied.
+The existing signing-challenge check verifies the certificate/key pair before
+kernel signing hooks and firmware enrollment. Preserve the installed public
+certificate for later reuse; a newly generated certificate is not necessarily
+byte-identical to one enrolled during an earlier installation.
 
 FIDO2 enrollment for root encryption, PAM and homed remains separate from
 signing. A configured FIDO2 credential/PIN is still required with either
@@ -31,7 +47,7 @@ is not arbitrary-token discovery.
 - `/etc/kernel/keys/openssl-signing.cnf` activates the default and PKCS#11
   providers only for wrapped commands. There is no global OpenSSL edit.
 - Token2 uses `/etc/kernel/keys/gnupg`, owned by root with mode 0700. The
-  installer discovers the card and imports the supplied public certificate.
+  installer discovers the card and imports the automatically prepared certificate.
   GnuPG PIN caching is disabled in this dedicated home; physical touch
   enforcement still depends on the token, and is **not established** by this
   integration. OpenPGP and FIDO2 PINs are distinct.
@@ -64,7 +80,7 @@ is not arbitrary-token discovery.
   for signing and package updates; unattended PIN entry is not implemented.
 
 The target phase rejects empty or multiple private-key URIs. It loads the
-selected key, signs a random challenge and verifies it against the supplied
+selected key, signs a random challenge and verifies it against the prepared
 certificate **before installing the kernel signing hooks**. This occurs
 **after disk partitioning and Debian bootstrap**, not before disk erasure.
 The fallback EFI signature is also verified before firmware enrollment.
@@ -72,13 +88,18 @@ Signing failures propagate; there is no software-key or unsigned fallback.
 
 ## Verification and recovery test plan
 
-Static and mocked checks (no disk or token operations):
+Checks using temporary files and mocked card access (no installation or token operations):
 
 ```sh
 bash -n devoid.sh
 bash -n devoid-usb.sh
 python3 -m unittest discover -s tests -v
 ```
+
+The suite also includes a real GPGSM batch certificate-generation/reuse test
+with a temporary software key. It is skipped where Unix sockets are prohibited
+and gpg-agent cannot run. Mocked tests cover certificate reuse, generation
+parameters and refusing a missing authentication key.
 
 Before relying on this integration, test both backend choices on expendable
 hardware with firmware recovery available. The earlier Token2 experiment
