@@ -784,6 +784,8 @@ target_side_code()
 	done
 
 	efi-updatevar -e -f "$SIGNING_KEY_ESL" db
+	# The first write may create db with the efivarfs immutable flag set.
+	chattr -i /sys/firmware/efi/efivars/db-d719b2cb-3d3a-4596-a3bc-dad00e67656f
 	efi-updatevar -a -e -f "$SERVICE_DRIVERS_ESL" db
 	efi-updatevar -e -f "$SIGNING_KEY_ESL" KEK
 	efi-updatevar -f "$PK_AUTH" PK
