@@ -677,6 +677,8 @@ target_side_code()
 	install -d -m 0755 /etc/dkms/framework.conf.d
 
 	cat <<- EOF > /etc/dkms/framework.conf.d/signing.conf
+		# The signing wrapper's private mounts trigger DKMS's chroot detection.
+		try_sign_modules="true"
 		mok_signing_key="${l_signing_private_key_uri}"
 		mok_certificate="${SIGNING_CERTIFICATE_DER}"
 		sign_file="/etc/dkms/sign_helper.sh"
